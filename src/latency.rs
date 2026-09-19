@@ -482,7 +482,7 @@ async fn measure_readable(
         ));
         let row = Readable { put, readable };
         if let Some(d) = row.delta_ms() {
-            progress(format_args!("    delta t_read-t_ack = {d:+.1} ms"));
+            progress_pub(format_args!("    delta t_read-t_ack = {d:+.1} ms"));
         }
         out.push(row);
     }
