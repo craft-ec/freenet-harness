@@ -93,12 +93,12 @@ impl Minted {
 
 /// One observation: a latency, or why there is no latency to report.
 #[derive(Clone)]
-enum Sample {
+pub(crate) enum Sample {
     Ms(f64),
     Failed(String),
 }
 
-fn ms(t: Instant) -> f64 {
+pub(crate) fn ms_since(t: Instant) -> f64 {
     t.elapsed().as_secs_f64() * 1000.0
 }
 
@@ -108,7 +108,7 @@ fn ms(t: Instant) -> f64 {
 /// await never returns and the harness hangs with no error and no sample — the
 /// one failure an instrument must not have, because it is indistinguishable
 /// from slow.
-async fn send_within(
+pub(crate) async fn send_req(
     client: &mut WebApi,
     req: ClientRequest<'static>,
     wait: Duration,
@@ -127,7 +127,7 @@ async fn send_within(
 /// Without them a long run is indistinguishable from a wedged one, and the
 /// rate — the thing you actually want when deciding whether to wait — can only
 /// be recovered by polling the file and diffing mtimes.
-fn progress(args: std::fmt::Arguments<'_>) {
+pub(crate) fn progress_pub(args: std::fmt::Arguments<'_>) {
     eprintln!("[{}] {args}", chrono_ish(std::time::SystemTime::now()));
 }
 
@@ -181,6 +181,19 @@ fn failures(samples: &[Sample]) -> Vec<&str> {
         .collect()
 }
 
+/// Put an already-built container and wait for its acknowledgement.
+pub(crate) async fn put_container(
+    client: &mut WebApi,
+    contract: ContractContainer,
+    state: &[u8],
+    wait: Duration,
+) -> Result<()> {
+    match timed_put(client, contract, state, wait).await? {
+        Sample::Ms(_) => Ok(()),
+        Sample::Failed(e) => bail!("seed put failed: {e}"),
+    }
+}
+
 /// Put one contract and time the acknowledgement.
 async fn timed_put(
     client: &mut WebApi,
@@ -190,7 +203,7 @@ async fn timed_put(
 ) -> Result<Sample> {
     let key = contract.key();
     let t = Instant::now();
-    send_within(
+    send_req(
         client,
         ClientRequest::ContractOp(ContractRequest::Put {
             contract,
@@ -206,7 +219,7 @@ async fn timed_put(
         Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key: k })))
             if k == key =>
         {
-            Sample::Ms(ms(t))
+            Sample::Ms(ms_since(t))
         }
         Ok(Ok(other)) => Sample::Failed(format!("unexpected response: {other:?}")),
         Ok(Err(e)) => Sample::Failed(format!("node error: {e}")),
@@ -223,7 +236,7 @@ async fn timed_get(
     wait: Duration,
 ) -> Result<Sample> {
     let t = Instant::now();
-    send_within(
+    send_req(
         client,
         ClientRequest::ContractOp(ContractRequest::Get {
             key: *key.id(),
@@ -240,7 +253,7 @@ async fn timed_get(
             ..
         }))) => {
             if got.as_ref() == want {
-                Sample::Ms(ms(t))
+                Sample::Ms(ms_since(t))
             } else {
                 Sample::Failed(format!(
                     "state mismatch: got {} B, expected {} B",
@@ -287,7 +300,7 @@ async fn measure_series(
         // The contract id on every sample: without it, matching a slow sample
         // to its transaction in the node log is guesswork by timestamp, and
         // guesswork is how a wrong cause gets published.
-        progress(format_args!(
+        progress_pub(format_args!(
             "  {} {} put {}/{n} {} {}",
             kind.name,
             kib(size),
@@ -303,7 +316,7 @@ async fn measure_series(
     for (key, state) in held.iter() {
         get.push(timed_get(client, key, state, wait).await?);
     }
-    progress(format_args!(
+    progress_pub(format_args!(
         "  {} {} done ({n} put, {} get)",
         kind.name,
         kib(size),
@@ -382,7 +395,7 @@ async fn poll_readable(
     let limit = limit.min(PROBE_LIMIT);
     let deadline = from + limit;
     while Instant::now() < deadline {
-        send_within(
+        send_req(
             client,
             ClientRequest::ContractOp(ContractRequest::Get {
                 key: *key.id(),
@@ -453,7 +466,7 @@ async fn measure_readable(
             poll_readable(reader, &key, &state, t0, wait, Duration::from_millis(50))
         );
         let (put, readable) = (put?, readable?);
-        progress(format_args!(
+        progress_pub(format_args!(
             "  readable {} {} {}/{n}  put {}  readable {}",
             kind.name,
             kib(size),
@@ -551,7 +564,7 @@ async fn measure_parallel(
     for _ in 0..n {
         let (contract, state) = (kind.make)(code, size)?;
         let key = contract.key();
-        send_within(
+        send_req(
             client,
             ClientRequest::ContractOp(ContractRequest::Put {
                 contract,
@@ -569,7 +582,7 @@ async fn measure_parallel(
         sent.insert(*key.id(), Instant::now());
         order.push(*key.id());
     }
-    let issued = ms(start);
+    let issued = ms_since(start);
     // Offset from batch start to each acknowledgement, in arrival order.
     let mut done_ms: Vec<f64> = Vec::with_capacity(n);
     let mut per_put: HashMap<ContractInstanceId, Sample> = HashMap::with_capacity(n);
@@ -589,7 +602,7 @@ async fn measure_parallel(
                         {
                             // Only a first acknowledgement advances the curve;
                             // a duplicate must not make the batch look faster.
-                            done_ms.push(ms(start));
+                            done_ms.push(ms_since(start));
                         }
                     }
                     // A straggler from an earlier batch on this same
@@ -597,7 +610,7 @@ async fn measure_parallel(
                     // waiting at its deadline, and its late answer must not
                     // abort this one. It is simply not ours to count.
                     None => {
-                        progress(format_args!(
+                        progress_pub(format_args!(
                             "  (late put response from an earlier batch: {id})"
                         ));
                     }
@@ -610,7 +623,7 @@ async fn measure_parallel(
             Err(_) => break,
         }
     }
-    let wall_ms = ms(start);
+    let wall_ms = ms_since(start);
     done_ms.sort_by(|a, b| a.partial_cmp(b).expect("elapsed times are never NaN"));
     // Anything still unanswered when the deadline passed is an error, in the
     // order it was issued, so the count in the table is N every time.
@@ -622,7 +635,7 @@ async fn measure_parallel(
             })
         })
         .collect::<Vec<_>>();
-    progress(format_args!(
+    progress_pub(format_args!(
         "  parallel N={n}: issued in {issued:.1} ms, all answers in {wall_ms:.1} ms"
     ));
     Ok(ParallelRun {
@@ -959,7 +972,7 @@ pub async fn run(
         let dkey = crate::register(&mut c, delegate_wasm, &salt, wait).await?;
         let _ = c.send(ClientRequest::Disconnect { cause: None }).await;
         for k in 1..=max_k {
-            progress(format_args!("  delegate put k={k}"));
+            progress_pub(format_args!("  delegate put k={k}"));
             let d = probe_delegate_put(ws, &dkey, &block_code, k, Duration::from_secs(30)).await?;
             println!(
                 "partial: DPUT k={} asked={} accepted={} refused/errored={}  {}",

@@ -3,6 +3,8 @@
 
 mod latency;
 mod stats;
+mod validate_cost;
+mod watch;
 
 use std::{
     sync::Arc,
@@ -85,6 +87,41 @@ enum Cmd {
         /// Run only one of the four measurements.
         #[arg(long, value_enum, default_value_t = latency::Part::All)]
         only: latency::Part,
+    },
+    /// What does the host's re-validation of the full state after every
+    /// update actually cost? Uses the validate-cost fixture.
+    ValidateCost {
+        #[arg(long, default_value = "build/validate-cost.wasm")]
+        wasm: String,
+        /// 0 = work in validate_state, 1 = work in update_state.
+        #[arg(long, default_value_t = 0)]
+        mode: u8,
+        /// BLAKE3 passes over the whole state per call (the calibration).
+        #[arg(long, default_value_t = 1)]
+        repeat: u32,
+        #[arg(long, value_enum, default_value_t = validate_cost::Arm::Growth)]
+        arm: validate_cost::Arm,
+        #[arg(long, default_value_t = 20)]
+        updates: usize,
+        /// Bytes appended per update on the growth arm.
+        #[arg(long, default_value_t = 16384)]
+        chunk: usize,
+        /// Seed the state to this size before the first update.
+        #[arg(long, default_value_t = 0)]
+        preload: usize,
+        /// 32 hex chars. Fixes the contract key so another node can address
+        /// the same contract; random when omitted.
+        #[arg(long)]
+        salt: Option<String>,
+    },
+    /// Cold-GET a contract, subscribe, and report what arrives — run on the
+    /// FAR node to see whether the near node's updates reach it.
+    Watch {
+        /// Contract instance id, as `validate-cost` prints it.
+        #[arg(long)]
+        key: String,
+        #[arg(long, default_value_t = 60)]
+        secs: u64,
     },
 }
 
@@ -421,6 +458,33 @@ async fn main() -> Result<()> {
                 wait,
             )
             .await?;
+        }
+        Cmd::ValidateCost {
+            wasm,
+            mode,
+            repeat,
+            arm,
+            updates,
+            chunk,
+            preload,
+            salt,
+        } => {
+            validate_cost::run(
+                &cli.ws,
+                &wasm,
+                mode,
+                repeat,
+                arm,
+                updates,
+                chunk,
+                preload,
+                salt.as_deref(),
+                wait,
+            )
+            .await?;
+        }
+        Cmd::Watch { key, secs } => {
+            watch::run(&cli.ws, &key, secs, wait).await?;
         }
     }
     Ok(())
