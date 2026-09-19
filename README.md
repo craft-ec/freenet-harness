@@ -3,4 +3,5 @@
 Drives a real Freenet node: deploys contracts, round-trips state, records
 timings. Every measured number in `craftworks-docs` comes from here.
 
-    cargo run -- roundtrip --n 3 --size 4096
+    cargo run -- roundtrip --n 3 --size 4096      # put N blocks, read them back
+    ./probe-delegate/build.sh && cargo run -- delegate-probe   # what can a delegate do on this node?

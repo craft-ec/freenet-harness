@@ -1,4 +1,3 @@
 target/
-build/*.wasm
+build/
 .DS_Store
-node_modules/
