@@ -4,6 +4,7 @@
 mod latency;
 mod stats;
 mod validate_cost;
+mod watch;
 
 use std::{
     sync::Arc,
@@ -108,6 +109,19 @@ enum Cmd {
         /// Seed the state to this size before the first update.
         #[arg(long, default_value_t = 0)]
         preload: usize,
+        /// 32 hex chars. Fixes the contract key so another node can address
+        /// the same contract; random when omitted.
+        #[arg(long)]
+        salt: Option<String>,
+    },
+    /// Cold-GET a contract, subscribe, and report what arrives — run on the
+    /// FAR node to see whether the near node's updates reach it.
+    Watch {
+        /// Contract instance id, as `validate-cost` prints it.
+        #[arg(long)]
+        key: String,
+        #[arg(long, default_value_t = 60)]
+        secs: u64,
     },
 }
 
@@ -453,11 +467,24 @@ async fn main() -> Result<()> {
             updates,
             chunk,
             preload,
+            salt,
         } => {
             validate_cost::run(
-                &cli.ws, &wasm, mode, repeat, arm, updates, chunk, preload, wait,
+                &cli.ws,
+                &wasm,
+                mode,
+                repeat,
+                arm,
+                updates,
+                chunk,
+                preload,
+                salt.as_deref(),
+                wait,
             )
             .await?;
+        }
+        Cmd::Watch { key, secs } => {
+            watch::run(&cli.ws, &key, secs, wait).await?;
         }
     }
     Ok(())

@@ -23,7 +23,7 @@
 
 use std::{sync::Arc, time::Duration};
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
 use freenet_stdlib::{
     client_api::{ClientRequest, ContractRequest, ContractResponse, HostResponse, WebApi},
     prelude::*,
@@ -115,18 +115,39 @@ pub async fn run(
     updates: usize,
     chunk: usize,
     preload: usize,
+    salt_hex: Option<&str>,
     wait: Duration,
 ) -> Result<()> {
     let code = Arc::new(ContractCode::from(std::fs::read(wasm).map_err(|e| {
         anyhow!("{wasm}: {e} — run fixtures/validate-cost-contract/build.sh first")
     })?));
+    // A caller-supplied salt makes the key reproducible, so a SECOND node can
+    // address the same contract — which is the whole point of the two-node
+    // arm. Random otherwise, so ordinary runs never collide.
     let mut salt = [0u8; 16];
-    getrandom::getrandom(&mut salt)?;
+    match salt_hex {
+        Some(h) => {
+            let h = h.trim();
+            if h.len() != 32 {
+                bail!("--salt must be 32 hex chars (16 bytes), got {}", h.len());
+            }
+            for (i, b) in salt.iter_mut().enumerate() {
+                *b = u8::from_str_radix(&h[i * 2..i * 2 + 2], 16)
+                    .map_err(|e| anyhow!("--salt is not hex: {e}"))?;
+            }
+        }
+        None => getrandom::getrandom(&mut salt)?,
+    }
     let contract = ContractContainer::Wasm(ContractWasmAPIVersion::V1(WrappedContract::new(
         code,
         params(mode, repeat, &salt),
     )));
     let key = contract.key();
+    println!(
+        "contract: {}  salt={}",
+        key.id(),
+        salt.iter().map(|b| format!("{b:02x}")).collect::<String>()
+    );
     let mut client = crate::connect(ws).await?;
 
     let mut state: Vec<u8> = salt.to_vec();

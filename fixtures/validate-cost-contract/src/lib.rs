@@ -89,17 +89,27 @@ impl ContractInterface for ValidateCost {
         };
         let mut next = state.as_ref().to_vec();
         for item in data {
-            // A full state is ADOPTED wholesale — it is not a tagged delta.
-            // The host hands `update_state` an `UpdateData::State` on the
-            // merge path of a PUT, so tag-parsing it rejects every re-put.
+            // A full state is merged MONOTONICALLY: the longer one wins.
+            //
+            // Adopting it wholesale is wrong twice over. The host hands
+            // `update_state` an `UpdateData::State` on the merge path of a
+            // PUT, so tag-parsing it rejects every re-put — but simply
+            // replacing state makes the merge non-monotonic, and a merge that
+            // can SHRINK is not a CRDT: two nodes then disagree forever and
+            // nothing converges. This fixture's state is append-only by
+            // construction, so "longer wins" is the merge that matches it.
             let bytes = match &item {
                 UpdateData::State(s) => {
-                    next = s.as_ref().to_vec();
+                    if s.as_ref().len() > next.len() {
+                        next = s.as_ref().to_vec();
+                    }
                     continue;
                 }
                 UpdateData::Delta(d) => d.as_ref(),
                 UpdateData::StateAndDelta { state, .. } => {
-                    next = state.as_ref().to_vec();
+                    if state.as_ref().len() > next.len() {
+                        next = state.as_ref().to_vec();
+                    }
                     continue;
                 }
                 _ => continue,
