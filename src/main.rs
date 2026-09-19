@@ -3,6 +3,7 @@
 
 mod latency;
 mod stats;
+mod validate_cost;
 
 use std::{
     sync::Arc,
@@ -85,6 +86,28 @@ enum Cmd {
         /// Run only one of the four measurements.
         #[arg(long, value_enum, default_value_t = latency::Part::All)]
         only: latency::Part,
+    },
+    /// What does the host's re-validation of the full state after every
+    /// update actually cost? Uses the validate-cost fixture.
+    ValidateCost {
+        #[arg(long, default_value = "build/validate-cost.wasm")]
+        wasm: String,
+        /// 0 = work in validate_state, 1 = work in update_state.
+        #[arg(long, default_value_t = 0)]
+        mode: u8,
+        /// BLAKE3 passes over the whole state per call (the calibration).
+        #[arg(long, default_value_t = 1)]
+        repeat: u32,
+        #[arg(long, value_enum, default_value_t = validate_cost::Arm::Growth)]
+        arm: validate_cost::Arm,
+        #[arg(long, default_value_t = 20)]
+        updates: usize,
+        /// Bytes appended per update on the growth arm.
+        #[arg(long, default_value_t = 16384)]
+        chunk: usize,
+        /// Seed the state to this size before the first update.
+        #[arg(long, default_value_t = 0)]
+        preload: usize,
     },
 }
 
@@ -419,6 +442,20 @@ async fn main() -> Result<()> {
                 max_k,
                 only,
                 wait,
+            )
+            .await?;
+        }
+        Cmd::ValidateCost {
+            wasm,
+            mode,
+            repeat,
+            arm,
+            updates,
+            chunk,
+            preload,
+        } => {
+            validate_cost::run(
+                &cli.ws, &wasm, mode, repeat, arm, updates, chunk, preload, wait,
             )
             .await?;
         }
