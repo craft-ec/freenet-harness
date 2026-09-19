@@ -233,6 +233,7 @@ async fn timed_get(
     client: &mut WebApi,
     key: &ContractKey,
     want: &[u8],
+    return_code: bool,
     wait: Duration,
 ) -> Result<Sample> {
     let t = Instant::now();
@@ -240,7 +241,9 @@ async fn timed_get(
         client,
         ClientRequest::ContractOp(ContractRequest::Get {
             key: *key.id(),
-            return_contract_code: false,
+            // Does the contract CODE ride a read, or only the state?
+            // The client asks; this flag is the whole question.
+            return_contract_code: return_code,
             subscribe: false,
             blocking_subscribe: false,
         }),
@@ -276,15 +279,27 @@ struct Series {
     get: Vec<Sample>,
 }
 
+/// What one (kind, size) series measures: the body size, how many samples,
+/// and whether each GET asks for the contract code as well as the state.
+struct SeriesSpec {
+    size: usize,
+    n: usize,
+    return_code: bool,
+}
+
 async fn measure_series(
     client: &mut WebApi,
     kind: &Kind,
     code: &Arc<ContractCode<'static>>,
-    size: usize,
-    n: usize,
+    spec: SeriesSpec,
     wait: Duration,
     minted: &mut Minted,
 ) -> Result<Series> {
+    let SeriesSpec {
+        size,
+        n,
+        return_code,
+    } = spec;
     let mut put = Vec::with_capacity(n);
     let mut held: Vec<(ContractKey, Vec<u8>)> = Vec::with_capacity(n);
     for i in 0..n {
@@ -314,7 +329,7 @@ async fn measure_series(
     }
     let mut get = Vec::with_capacity(held.len());
     for (key, state) in held.iter() {
-        get.push(timed_get(client, key, state, wait).await?);
+        get.push(timed_get(client, key, state, return_code, wait).await?);
     }
     progress_pub(format_args!(
         "  {} {} done ({n} put, {} get)",
@@ -875,6 +890,7 @@ pub async fn run(
     parallel_size: usize,
     max_k: usize,
     only: Part,
+    return_code: bool,
     wait: Duration,
 ) -> Result<()> {
     if samples == 0 {
@@ -894,8 +910,19 @@ pub async fn run(
     if only.wants(Part::Put) || only.wants(Part::Get) {
         for kind in KINDS {
             for &size in sizes {
-                let s = measure_series(&mut client, kind, &code, size, samples, wait, &mut minted)
-                    .await?;
+                let s = measure_series(
+                    &mut client,
+                    kind,
+                    &code,
+                    SeriesSpec {
+                        size,
+                        n: samples,
+                        return_code,
+                    },
+                    wait,
+                    &mut minted,
+                )
+                .await?;
                 emit(&format!("PUT  {} {}", s.kind, kib(s.size)), &s.put);
                 emit(&format!("GET  {} {}", s.kind, kib(s.size)), &s.get);
                 series.push(s);
