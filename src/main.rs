@@ -1,4 +1,8 @@
-//! Drives a real Freenet node: round-trips Blocks, probes delegate capabilities.
+//! Drives a real Freenet node: round-trips Blocks, measures put/get latency,
+//! probes delegate capabilities.
+
+mod latency;
+mod stats;
 
 use std::{
     sync::Arc,
@@ -55,9 +59,36 @@ enum Cmd {
         #[arg(long, default_value_t = 3)]
         wake_secs: u32,
     },
+    /// Put/get latency per contract kind and size, parallel-put behaviour, and
+    /// whether a delegate may put (FREENET-CONSTRAINTS F15).
+    Latency {
+        #[arg(long, default_value = "../freenet-contracts/build/block.wasm")]
+        wasm: String,
+        /// Probe delegate used for the delegate-put question.
+        #[arg(long, default_value = "build/probe.wasm")]
+        delegate_wasm: String,
+        /// Samples per kind and size. The issue asks for at least 30.
+        #[arg(long, default_value_t = 30)]
+        samples: usize,
+        /// Body sizes in bytes.
+        #[arg(long, value_delimiter = ',', default_values_t = [1024, 4096, 16384, 262144])]
+        sizes: Vec<usize>,
+        /// How many puts to issue at once, per parallel run.
+        #[arg(long, value_delimiter = ',', default_values_t = [4, 8, 16, 32])]
+        parallel: Vec<usize>,
+        /// Body size for the parallel runs.
+        #[arg(long, default_value_t = 4096)]
+        parallel_size: usize,
+        /// Largest k of puts asked for from a single delegate process() return.
+        #[arg(long, default_value_t = 8)]
+        max_k: usize,
+        /// Run only one of the four measurements.
+        #[arg(long, value_enum, default_value_t = latency::Part::All)]
+        only: latency::Part,
+    },
 }
 
-async fn connect(ws: &str) -> Result<WebApi> {
+pub(crate) async fn connect(ws: &str) -> Result<WebApi> {
     let (stream, _) = tokio_tungstenite::connect_async(ws)
         .await
         .map_err(|e| anyhow!("cannot reach the node at {ws}: {e}"))?;
@@ -98,7 +129,7 @@ async fn put_block(
 }
 
 /// Register a delegate wasm with `params`; returns its key.
-async fn register(
+pub(crate) async fn register(
     client: &mut WebApi,
     wasm: &str,
     params: &[u8],
@@ -130,13 +161,18 @@ async fn register(
 }
 
 /// Send one app message to a delegate on a fresh connection; collect every
-/// application reply that arrives within `listen`.
-async fn ask(
+/// application reply that arrives within `listen`, and every error the node
+/// reported instead.
+///
+/// Errors come back as text rather than aborting, because a probe measuring a
+/// refusal needs the node's own words: "the node refused this" is the finding,
+/// not a failure of the harness.
+pub(crate) async fn ask_raw(
     ws: &str,
     key: &DelegateKey,
     payload: Vec<u8>,
     listen: Duration,
-) -> Result<Vec<String>> {
+) -> Result<(Vec<String>, Vec<String>)> {
     let mut c = connect(ws).await?;
     c.send(ClientRequest::DelegateOp(
         DelegateRequest::ApplicationMessages {
@@ -148,7 +184,7 @@ async fn ask(
         },
     ))
     .await?;
-    let mut out = Vec::new();
+    let (mut out, mut errs) = (Vec::new(), Vec::new());
     let end = Instant::now() + listen;
     while let Some(left) = end.checked_duration_since(Instant::now()) {
         match timeout(left, c.recv()).await {
@@ -163,16 +199,33 @@ async fn ask(
                 }
             }
             Ok(Ok(_)) => {}
-            Ok(Err(e)) => bail!("delegate connection error: {e:?}"),
+            Ok(Err(e)) => {
+                errs.push(format!("{e:?}"));
+                break;
+            }
             Err(_) => break,
         }
     }
     let _ = c.send(ClientRequest::Disconnect { cause: None }).await;
+    Ok((out, errs))
+}
+
+/// [`ask_raw`] for callers that treat a node error as a failure.
+pub(crate) async fn ask(
+    ws: &str,
+    key: &DelegateKey,
+    payload: Vec<u8>,
+    listen: Duration,
+) -> Result<Vec<String>> {
+    let (out, errs) = ask_raw(ws, key, payload, listen).await?;
+    if let Some(e) = errs.first() {
+        bail!("delegate connection error: {e}");
+    }
     Ok(out)
 }
 
 /// Poll `stat` until `done(reply)` or `limit` elapses; returns the elapsed time.
-async fn poll_stat(
+pub(crate) async fn poll_stat(
     ws: &str,
     key: &DelegateKey,
     limit: Duration,
@@ -344,6 +397,30 @@ async fn main() -> Result<()> {
                 if get_ok { "yes" } else { "no" },
                 if wake_ok { "yes" } else { "no" }
             );
+        }
+        Cmd::Latency {
+            wasm,
+            delegate_wasm,
+            samples,
+            sizes,
+            parallel,
+            parallel_size,
+            max_k,
+            only,
+        } => {
+            latency::run(
+                &cli.ws,
+                &wasm,
+                &delegate_wasm,
+                samples,
+                &sizes,
+                &parallel,
+                parallel_size,
+                max_k,
+                only,
+                wait,
+            )
+            .await?;
         }
     }
     Ok(())
