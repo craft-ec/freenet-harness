@@ -326,8 +326,24 @@ async fn measure_series(
 /// and let propagation trail. The poll runs on its own connection so it cannot
 /// be answered by the put's own response.
 struct Readable {
+    /// t_ack - t0, where t0 is immediately before the put request is sent.
     put: Sample,
+    /// t_read - t0, same t0. One clock for both, so the per-sample
+    /// DIFFERENCE is meaningful rather than a subtraction of two medians
+    /// taken from different distributions.
     readable: Sample,
+}
+
+impl Readable {
+    /// t_read - t_ack for this sample. Negative means the node served the
+    /// block BEFORE it acknowledged the put — the case that would let a write
+    /// pipeline commit on local acceptance.
+    fn delta_ms(&self) -> Option<f64> {
+        match (&self.put, &self.readable) {
+            (Sample::Ms(ack), Sample::Ms(read)) => Some(read - ack),
+            _ => None,
+        }
+    }
 }
 
 /// Ask for `key` until the node returns exactly `want`.
@@ -342,8 +358,15 @@ struct Readable {
 ///
 /// Responses for any other key are discarded, so a late answer to an abandoned
 /// attempt cannot be mistaken for a hit.
-const PROBE_ATTEMPT: Duration = Duration::from_millis(250);
-const PROBE_GAP: Duration = Duration::from_millis(250);
+/// The poll period is the measurement's RESOLUTION, so it must be small
+/// against the quantity being measured. At 250+250 ms every sample landed on
+/// the second poll (120 of 120 between 300 and 600 ms, none outside) and the
+/// reported figure was the schedule, not the node — fatal where the ack itself
+/// is ~500 ms. A warm GET answers in 0.2-1.5 ms, so 40 ms is ample per attempt.
+const PROBE_ATTEMPT: Duration = Duration::from_millis(40);
+const PROBE_GAP: Duration = Duration::from_millis(10);
+/// One poll period: no readable figure can be finer than this.
+const PROBE_GRID_MS: f64 = 50.0;
 /// Past this, the answer to "readable before the PutResponse?" is already no,
 /// and continuing only piles up network searches inside the node.
 const PROBE_LIMIT: Duration = Duration::from_secs(30);
@@ -444,7 +467,11 @@ async fn measure_readable(
                 Sample::Failed(_) => "never".into(),
             }
         ));
-        out.push(Readable { put, readable });
+        let row = Readable { put, readable };
+        if let Some(d) = row.delta_ms() {
+            progress(format_args!("    delta t_read-t_ack = {d:+.1} ms"));
+        }
+        out.push(row);
     }
     Ok(out)
 }
@@ -1087,42 +1114,52 @@ fn print_parallel(runs: &[ParallelRun]) {
     println!();
 }
 
-/// Put latency and readable-here latency side by side, because the gap
-/// between them is the whole question.
+/// Put latency, readable-here latency, and above all the PER-SAMPLE
+/// difference between them.
+///
+/// Two independent medians cannot answer "is the block readable before the
+/// ack?" — that is a question about each sample, and a distribution of
+/// differences is not recoverable from a difference of distributions. The
+/// column that decides the design question is `read<ack`.
 fn print_readable(rows: &[(&'static str, usize, Vec<Readable>)]) {
     let mut t = Table::new([
-        "kind",
-        "size",
-        "n",
-        "put p50",
-        "put p99",
-        "readable p50",
-        "readable p99",
-        "never readable",
+        "kind", "size", "n", "ack p50", "read p50", "d p50", "d p90", "d p99", "read<ack", "never",
     ]);
     for (kind, size, rs) in rows {
-        let puts: Vec<Sample> = rs.iter().map(|r| r.put.clone()).collect();
+        let acks: Vec<Sample> = rs.iter().map(|r| r.put.clone()).collect();
         let reads: Vec<Sample> = rs.iter().map(|r| r.readable.clone()).collect();
-        let (ps, rz) = (
-            Summary::of(&latencies(&puts)),
-            Summary::of(&latencies(&reads)),
-        );
+        let deltas: Vec<f64> = rs.iter().filter_map(|r| r.delta_ms()).collect();
+        let earlier = deltas.iter().filter(|d| **d < 0.0).count();
+        let d = Summary::of(&deltas);
         let cell = |s: &Option<Summary>, f: fn(&Summary) -> f64| match s {
-            Some(v) => format!("{:.1}", f(v)),
+            Some(v) => format!("{:+.1}", f(v)),
+            None => "-".to_string(),
+        };
+        let p50 = |v: &[Sample]| match Summary::of(&latencies(v)) {
+            Some(s) => format!("{:.1}", s.p50),
             None => "-".to_string(),
         };
         t.row([
             kind.to_string(),
             kib(*size),
-            rs.len().to_string(),
-            cell(&ps, |s| s.p50),
-            cell(&ps, |s| s.p99),
-            cell(&rz, |s| s.p50),
-            cell(&rz, |s| s.p99),
+            deltas.len().to_string(),
+            p50(&acks),
+            p50(&reads),
+            cell(&d, |s| s.p50),
+            cell(&d, |s| s.p90),
+            cell(&d, |s| s.p99),
+            earlier.to_string(),
             failures(&reads).len().to_string(),
         ]);
     }
     print!("{t}");
+    println!("   d = t_read - t_ack per sample, one clock, both from t0 (put request sent).");
+    println!("   read<ack counts samples the node served BEFORE acknowledging the put.");
+    println!(
+        "   probe resolution {PROBE_GRID_MS:.0} ms: t_read is quantised to it. A read p50 \
+sitting on a multiple of {PROBE_GRID_MS:.0} ms is instrument-limited, not measured, \
+and d is only meaningful while t_ack is large against it."
+    );
     println!();
 }
 
@@ -1141,4 +1178,71 @@ fn print_delegate(dputs: &[DelegatePut]) {
         println!("   k={}: {}", d.k, d.detail);
     }
     println!();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pair(ack: f64, read: f64) -> Readable {
+        Readable {
+            put: Sample::Ms(ack),
+            readable: Sample::Ms(read),
+        }
+    }
+
+    /// The sign convention is the whole point: negative means the node served
+    /// the block before it acknowledged the put.
+    #[test]
+    fn delta_is_read_minus_ack() {
+        assert_eq!(pair(1000.0, 1500.0).delta_ms(), Some(500.0));
+        assert_eq!(pair(1500.0, 1000.0).delta_ms(), Some(-500.0));
+    }
+
+    /// A sample missing either half has no difference — it must not be
+    /// silently counted as zero, which would drag the median toward "same
+    /// time" and hide the answer.
+    #[test]
+    fn a_half_measured_sample_has_no_delta() {
+        let only_ack = Readable {
+            put: Sample::Ms(10.0),
+            readable: Sample::Failed("never readable".into()),
+        };
+        let only_read = Readable {
+            put: Sample::Failed("put failed".into()),
+            readable: Sample::Ms(10.0),
+        };
+        assert_eq!(only_ack.delta_ms(), None);
+        assert_eq!(only_read.delta_ms(), None);
+    }
+
+    /// Medians of the two series can agree while every sample disagrees —
+    /// which is exactly why the per-sample difference is reported.
+    #[test]
+    fn paired_difference_is_not_recoverable_from_two_medians() {
+        let rows = [pair(100.0, 900.0), pair(900.0, 100.0)];
+        let acks: Vec<f64> = rows
+            .iter()
+            .filter_map(|r| match r.put {
+                Sample::Ms(v) => Some(v),
+                _ => None,
+            })
+            .collect();
+        let reads: Vec<f64> = rows
+            .iter()
+            .filter_map(|r| match r.readable {
+                Sample::Ms(v) => Some(v),
+                _ => None,
+            })
+            .collect();
+        // Identical medians...
+        assert_eq!(
+            Summary::of(&acks).unwrap().p50,
+            Summary::of(&reads).unwrap().p50
+        );
+        // ...yet no sample had t_read == t_ack, and one was served early.
+        let deltas: Vec<f64> = rows.iter().filter_map(|r| r.delta_ms()).collect();
+        assert_eq!(deltas, [800.0, -800.0]);
+        assert_eq!(deltas.iter().filter(|d| **d < 0.0).count(), 1);
+    }
 }
