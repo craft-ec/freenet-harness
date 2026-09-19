@@ -1,4 +1,4 @@
-//! Drives a real Freenet node. Phase 0: put a Block, get it back, time both.
+//! Drives a real Freenet node: round-trips Blocks, probes delegate capabilities.
 
 use std::{
     sync::Arc,
@@ -9,7 +9,9 @@ use anyhow::{anyhow, bail, Result};
 use clap::{Parser, Subcommand};
 use craftec_block_contract as block;
 use freenet_stdlib::{
-    client_api::{ClientRequest, ContractRequest, ContractResponse, HostResponse, WebApi},
+    client_api::{
+        ClientRequest, ContractRequest, ContractResponse, DelegateRequest, HostResponse, WebApi,
+    },
     prelude::*,
 };
 use tokio::time::timeout;
@@ -39,6 +41,20 @@ enum Cmd {
         #[arg(long, default_value_t = 4096)]
         size: usize,
     },
+    /// Does this node run delegate wakeups and delegate-originated contract GETs?
+    DelegateProbe {
+        #[arg(long, default_value = "../freenet-contracts/build/block.wasm")]
+        block_wasm: String,
+        /// Probe built without the wakeup import.
+        #[arg(long, default_value = "build/probe.wasm")]
+        delegate_wasm: String,
+        /// Probe built with the wakeup import (a node lacking it cannot load this).
+        #[arg(long, default_value = "build/probe-wakeup.wasm")]
+        wakeup_wasm: String,
+        /// Wakeup delay to request, seconds.
+        #[arg(long, default_value_t = 3)]
+        wake_secs: u32,
+    },
 }
 
 async fn connect(ws: &str) -> Result<WebApi> {
@@ -46,6 +62,136 @@ async fn connect(ws: &str) -> Result<WebApi> {
         .await
         .map_err(|e| anyhow!("cannot reach the node at {ws}: {e}"))?;
     Ok(WebApi::start(stream))
+}
+
+/// Put one fresh Block; returns its contract instance id and state.
+async fn put_block(
+    client: &mut WebApi,
+    code: &Arc<ContractCode<'static>>,
+    body: &[u8],
+    wait: Duration,
+) -> Result<(ContractKey, Vec<u8>)> {
+    let state = block::encode(block::kind::RAW, body);
+    let params = Parameters::from(blake3::hash(&state).as_bytes().to_vec());
+    let contract = ContractContainer::Wasm(ContractWasmAPIVersion::V1(WrappedContract::new(
+        code.clone(),
+        params,
+    )));
+    let key = contract.key();
+    client
+        .send(ClientRequest::ContractOp(ContractRequest::Put {
+            contract,
+            state: WrappedState::from(state.clone()),
+            related_contracts: RelatedContracts::default(),
+            subscribe: false,
+            blocking_subscribe: false,
+        }))
+        .await?;
+    match timeout(wait, client.recv()).await {
+        Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key: k })))
+            if k == key =>
+        {
+            Ok((key, state))
+        }
+        other => bail!("put failed: {other:?}"),
+    }
+}
+
+/// Register a delegate wasm with `params`; returns its key.
+async fn register(
+    client: &mut WebApi,
+    wasm: &str,
+    params: &[u8],
+    wait: Duration,
+) -> Result<DelegateKey> {
+    let code = std::fs::read(wasm)
+        .map_err(|e| anyhow!("{wasm}: {e} — run probe-delegate/build.sh first"))?;
+    let delegate = Delegate::from((
+        &DelegateCode::from(code),
+        &Parameters::from(params.to_vec()),
+    ));
+    let key = delegate.key().clone();
+    let (mut cipher, mut nonce) = ([0u8; 32], [0u8; 24]);
+    getrandom::getrandom(&mut cipher)?;
+    getrandom::getrandom(&mut nonce)?;
+    client
+        .send(ClientRequest::DelegateOp(
+            DelegateRequest::RegisterDelegate {
+                delegate: DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(delegate)),
+                cipher,
+                nonce,
+            },
+        ))
+        .await?;
+    match timeout(wait, client.recv()).await {
+        Ok(Ok(HostResponse::DelegateResponse { .. })) => Ok(key),
+        other => bail!("register {wasm} failed: {other:?}"),
+    }
+}
+
+/// Send one app message to a delegate on a fresh connection; collect every
+/// application reply that arrives within `listen`.
+async fn ask(
+    ws: &str,
+    key: &DelegateKey,
+    payload: Vec<u8>,
+    listen: Duration,
+) -> Result<Vec<String>> {
+    let mut c = connect(ws).await?;
+    c.send(ClientRequest::DelegateOp(
+        DelegateRequest::ApplicationMessages {
+            key: key.clone(),
+            params: Parameters::from(Vec::new()),
+            inbound: vec![InboundDelegateMsg::ApplicationMessage(
+                ApplicationMessage::new(payload),
+            )],
+        },
+    ))
+    .await?;
+    let mut out = Vec::new();
+    let end = Instant::now() + listen;
+    while let Some(left) = end.checked_duration_since(Instant::now()) {
+        match timeout(left, c.recv()).await {
+            Ok(Ok(HostResponse::DelegateResponse { values, .. })) => {
+                for v in values {
+                    if let OutboundDelegateMsg::ApplicationMessage(m) = v {
+                        out.push(String::from_utf8_lossy(&m.payload).into_owned());
+                    }
+                }
+                if !out.is_empty() {
+                    break;
+                }
+            }
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => bail!("delegate connection error: {e:?}"),
+            Err(_) => break,
+        }
+    }
+    let _ = c.send(ClientRequest::Disconnect { cause: None }).await;
+    Ok(out)
+}
+
+/// Poll `stat` until `done(reply)` or `limit` elapses; returns the elapsed time.
+async fn poll_stat(
+    ws: &str,
+    key: &DelegateKey,
+    limit: Duration,
+    done: impl Fn(&str) -> bool,
+) -> Result<Option<(Duration, String)>> {
+    let t = Instant::now();
+    while t.elapsed() < limit {
+        if let Some(r) = ask(ws, key, b"stat".to_vec(), Duration::from_secs(10))
+            .await?
+            .into_iter()
+            .next()
+        {
+            if done(&r) {
+                return Ok(Some((t.elapsed(), r)));
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    Ok(None)
 }
 
 #[tokio::main]
@@ -119,6 +265,85 @@ async fn main() -> Result<()> {
                 bail!("round-tripped {} of {n} blocks", put_ms.len());
             }
             println!("OK {n}/{n} blocks of {size} B round-tripped");
+        }
+        Cmd::DelegateProbe {
+            block_wasm,
+            delegate_wasm,
+            wakeup_wasm,
+            wake_secs,
+        } => {
+            // 1. A block this node holds, for the delegate to fetch.
+            let code = Arc::new(ContractCode::from(std::fs::read(&block_wasm)?));
+            let mut client = connect(&cli.ws).await?;
+            let mut salt = [0u8; 16];
+            getrandom::getrandom(&mut salt)?;
+            let body = [b"delegate-probe ".as_slice(), &salt].concat();
+            let (bkey, state) = put_block(&mut client, &code, &body, wait).await?;
+            println!("block put: {} ({} B)", bkey.id(), state.len());
+
+            // 2. Register the base probe (fresh params → fresh secrets).
+            let dkey = register(&mut client, &delegate_wasm, &salt, wait).await?;
+            println!("delegate registered (base)");
+
+            // 3. Contract GET from inside the delegate.
+            let mut msg = b"get".to_vec();
+            msg.extend_from_slice(bkey.id().as_bytes());
+            let t = Instant::now();
+            let direct = ask(&cli.ws, &dkey, msg, Duration::from_secs(20)).await?;
+            let want = format!("get=ok:{}", state.len());
+            let got = poll_stat(&cli.ws, &dkey, Duration::from_secs(60), |r| {
+                !r.contains("get=pending")
+            })
+            .await?;
+            let get_ok = matches!(&got, Some((_, r)) if r.contains(&want));
+            println!(
+                "delegate GET: {} | reply on asking connection: {:?} | recorded: {:?} | {} ms",
+                if get_ok { "WORKS" } else { "MISSING" },
+                direct,
+                got.as_ref().map(|g| g.1.as_str()),
+                t.elapsed().as_millis()
+            );
+
+            // 4. Wakeup — a separate build, because a node without the host
+            //    function refuses to instantiate any wasm that imports it.
+            let wkey = register(&mut client, &wakeup_wasm, &salt, wait).await?;
+            let _ = client.send(ClientRequest::Disconnect { cause: None }).await;
+            let mut msg = b"wake".to_vec();
+            msg.extend_from_slice(&wake_secs.to_le_bytes());
+            let (wake_ok, detail) = match ask(&cli.ws, &wkey, msg, Duration::from_secs(10)).await {
+                Err(e) => (false, format!("node refused the delegate: {e}")),
+                Ok(armed) => {
+                    let fired = poll_stat(
+                        &cli.ws,
+                        &wkey,
+                        Duration::from_secs(wake_secs as u64 + 30),
+                        |r| r.contains("fired=1"),
+                    )
+                    .await?;
+                    (
+                        fired.is_some(),
+                        format!(
+                            "arm reply {:?}, requested {} s, observed {}",
+                            armed,
+                            wake_secs,
+                            fired
+                                .map(|f| format!("{} ms", f.0.as_millis()))
+                                .unwrap_or_else(|| "never".into())
+                        ),
+                    )
+                }
+            };
+            println!(
+                "delegate WAKEUP: {} | {detail}",
+                if wake_ok { "WORKS" } else { "MISSING" }
+            );
+
+            // A probe reports; it fails only if it could not run.
+            println!(
+                "SUMMARY node-side contract GET: {} · wakeup: {}",
+                if get_ok { "yes" } else { "no" },
+                if wake_ok { "yes" } else { "no" }
+            );
         }
     }
     Ok(())
