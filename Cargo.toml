@@ -1,0 +1,16 @@
+[package]
+name = "freenet-harness"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "Drives a real Freenet node: deploys contracts, round-trips state, records timings."
+
+[dependencies]
+craftec-block-contract = { path = "../freenet-contracts/block", default-features = false }
+freenet-stdlib = { version = "0.10.0", features = ["net"] }
+blake3 = "1"
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = "0.27"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
