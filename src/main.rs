@@ -87,6 +87,10 @@ enum Cmd {
         /// Run only one of the four measurements.
         #[arg(long, value_enum, default_value_t = latency::Part::All)]
         only: latency::Part,
+        /// Ask the node to return the contract CODE with each GET, not just
+        /// the state — does code ride reads as well as writes?
+        #[arg(long, default_value_t = false)]
+        return_code: bool,
     },
     /// What does the host's re-validation of the full state after every
     /// update actually cost? Uses the validate-cost fixture.
@@ -444,6 +448,7 @@ async fn main() -> Result<()> {
             parallel_size,
             max_k,
             only,
+            return_code,
         } => {
             latency::run(
                 &cli.ws,
@@ -455,6 +460,7 @@ async fn main() -> Result<()> {
                 parallel_size,
                 max_k,
                 only,
+                return_code,
                 wait,
             )
             .await?;
