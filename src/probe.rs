@@ -112,6 +112,7 @@ impl Ledger {
         });
         self.rec.event(Event::Counter {
             site: SEND,
+            op: OpId::NONE,
             entry: Entry {
                 key: Key::Sent,
                 value: 1,
@@ -129,6 +130,104 @@ impl Ledger {
             Err(p) => p.into_inner().push(id),
         }
         id
+    }
+
+    /// Record a request for a key the CALLER can name, labelled by that key.
+    ///
+    /// The ordinary [`request`](Ledger::request) labels by a per-connection
+    /// sequence, which is all a transport can know. But when the answer will
+    /// name itself — a `PutResponse` carries the contract key — labelling the
+    /// request by that key is what lets the recording say WHICH operation an
+    /// answer ended, instead of pairing by position.
+    ///
+    /// The key itself never enters an event: it goes into `Labels` and only
+    /// the ordinal comes out (`contract#3`).
+    pub fn request_keyed(&self, what: &'static str, key: &str) -> Label {
+        let id = match self.labels.lock() {
+            Ok(mut l) => l.label(Kind::Contract, &key.to_string()),
+            Err(p) => p.into_inner().label(Kind::Contract, &key.to_string()),
+        };
+        self.rec.event(Event::Edge {
+            site: SEND,
+            dir: Dir::Request,
+            id,
+        });
+        self.rec.event(Event::Counter {
+            site: SEND,
+            op: id.op(),
+            entry: Entry {
+                key: Key::Sent,
+                value: 1,
+            },
+        });
+        self.rec.event(Event::Enter {
+            site: SEND,
+            op: id.op(),
+        });
+        let _ = what;
+        if let Ok(mut l) = self.last.lock() {
+            *l = Some(id);
+        }
+        match self.open.lock() {
+            Ok(mut o) => o.push(id),
+            Err(p) => p.into_inner().push(id),
+        }
+        id
+    }
+
+    /// Record an answer that NAMED itself.
+    ///
+    /// This is the whole point of the keyed path: the answer closes the
+    /// operation that asked for THIS key, whatever else is outstanding and
+    /// however long ago it was given up on. No position, no count.
+    pub fn answered(&self, key: &str) -> Label {
+        let id = match self.labels.lock() {
+            Ok(mut l) => l.label(Kind::Contract, &key.to_string()),
+            Err(p) => p.into_inner().label(Kind::Contract, &key.to_string()),
+        };
+        self.rec.event(Event::Edge {
+            site: RECV,
+            dir: Dir::Response,
+            id,
+        });
+        self.rec.event(Event::Counter {
+            site: RECV,
+            op: id.op(),
+            entry: Entry {
+                key: Key::Received,
+                value: 1,
+            },
+        });
+        if let Ok(mut o) = self.open.lock() {
+            if let Some(i) = o.iter().position(|l| *l == id) {
+                o.remove(i);
+            }
+        }
+        id
+    }
+
+    /// What happened to every keyed operation — the projection that replaces
+    /// a tool's own per-key map.
+    ///
+    /// A tool that keeps its own map keeps a SECOND account of the same facts,
+    /// and the two disagree: one printed 99.5 % acked over a run whose records
+    /// said 92.1 %. Both come from here now, so they cannot.
+    pub fn answers(&self) -> Vec<(Label, instrument::Answered)> {
+        self.rec.recording().answers()
+    }
+
+    /// The same data a per-key table reads, counted.
+    pub fn answer_counts(&self) -> Vec<(instrument::Answered, usize)> {
+        self.rec.recording().answer_counts()
+    }
+
+    /// Resolve a label back to the key it stands for — for the TOOL's own
+    /// files, never for an event.
+    pub fn key_of(&self, id: Label) -> Option<String> {
+        match self.labels.lock() {
+            Ok(l) => l.resolve(id).cloned(),
+            Err(p) => p.into_inner().resolve(id).cloned(),
+        }
     }
 
     /// Close an operation with the outcome the CALLER knows.
@@ -156,6 +255,7 @@ impl Ledger {
             self.owed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.rec.event(Event::Counter {
                 site: SEND,
+                op: OpId::NONE,
                 entry: Entry {
                     key: Key::Owed,
                     value: 1,
@@ -199,6 +299,7 @@ impl Ledger {
             for key in [Key::Received, Key::Ambiguous] {
                 self.rec.event(Event::Counter {
                     site: RECV,
+                    op: OpId::NONE,
                     entry: Entry { key, value: 1 },
                 });
             }
@@ -233,6 +334,7 @@ impl Ledger {
         }
         self.rec.event(Event::Counter {
             site: RECV,
+            op: OpId::NONE,
             entry: Entry {
                 key: Key::Received,
                 value: 1,
@@ -373,6 +475,38 @@ impl Client {
 
     pub fn dump(&self, what: &'static str) -> String {
         self.ledger.dump(what)
+    }
+
+    /// Send, labelling the operation by a key the ANSWER will name.
+    ///
+    /// Use this wherever the response carries an identifier — a `PutResponse`
+    /// carries the contract key. It is what makes the recording able to say
+    /// which operation an answer ended.
+    pub fn send_keyed(&mut self, req: ClientRequest<'static>, key: &str) -> Sent<'_> {
+        let id = self.ledger.request_keyed(describe(&req), key);
+        Sent {
+            id,
+            fut: Box::pin(async move { self.inner.send(req).await.map_err(Into::into) }),
+        }
+    }
+
+    /// Record an answer that named itself.
+    pub fn answered(&self, key: &str) {
+        self.ledger.answered(key);
+    }
+
+    /// What happened to every keyed operation. ONE projection — a tool that
+    /// keeps its own per-key map keeps a second account that can disagree.
+    pub fn answers(&self) -> Vec<(Label, instrument::Answered)> {
+        self.ledger.answers()
+    }
+
+    pub fn answer_counts(&self) -> Vec<(instrument::Answered, usize)> {
+        self.ledger.answer_counts()
+    }
+
+    pub fn key_of(&self, id: Label) -> Option<String> {
+        self.ledger.key_of(id)
     }
 
     /// Say how a NAMED operation ended, when the caller knows better than the
