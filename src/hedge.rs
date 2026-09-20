@@ -460,34 +460,44 @@ pub async fn run(ws: &str, o: Opts) -> Result<()> {
     print!("{t2}");
     println!();
 
-    // ---- what the hedges cost, and how many were wasted ---------------------
+    // ---- what the hedges cost ----------------------------------------------
     //
-    // "Wasted" cannot be observed directly: both puts carry the same key, so an
-    // acknowledgement does not say which offer produced it. What CAN be
-    // measured is the control arm's behaviour on the same population — of the
-    // control trials still unacked at T, how many acked anyway with no help.
-    // That rate, applied to the hedges fired, is the expected waste.
-    println!("3. cost, and the hedges that were probably unnecessary");
+    // "Wasted" cannot be observed directly: both offers carry the same key, so
+    // an acknowledgement does not say which one produced it. The obvious proxy
+    // — how many control trials still unacked at T acked ANYWAY — turned out to
+    // be actively misleading, and the hotspot run is what showed it. There, 96%
+    // of them did ack anyway, which reads as "96% of hedges were pointless"
+    // until you look at WHEN: the control's p90 was 61 seconds. They acked, at
+    // the far end of the tail, which is precisely the wait the hedge exists to
+    // cut. So the line reports both halves and refuses to call the first one
+    // waste on its own.
+    println!("3. what the hedges cost, and what the control did without them");
     for arm in arms.iter().filter(|a| a.t.is_some()) {
         let hedges = arm.trials.iter().filter(|x| x.hedged).count();
         let t = arm.t.expect("filtered to hedged arms");
         let pool: Vec<&Trial> = control.trials.iter().filter(|x| late(x, t)).collect();
-        let waste_rate = (!pool.is_empty())
-            .then(|| pool.iter().filter(|x| x.ack.is_some()).count() as f64 / pool.len() as f64);
+        let acked_anyway = pool.iter().filter(|x| x.ack.is_some()).count();
+        let when = Summary::of(&pool.iter().filter_map(|x| x.ack).collect::<Vec<f64>>());
         println!(
-            "   {}: {hedges} extra puts, {} extra on the wire{}",
+            "   {}: {hedges} extra puts, {} extra on the wire",
             arm.name(),
-            kib(hedges * (o.size + code_len)),
-            match waste_rate {
-                Some(r) => format!(
-                    " — in the control, {:.0} % of trials still unacked at that point acked anyway, so about {:.0} of these hedges were probably unnecessary",
-                    100.0 * r,
-                    r * hedges as f64
-                ),
-                None => " — no control population to compare against".to_string(),
-            }
+            kib(hedges * (o.size + code_len))
         );
+        match (pool.is_empty(), when) {
+            (true, _) | (_, None) => {
+                println!("      no control population at this T to compare against")
+            }
+            (false, Some(w)) => println!(
+                "      of the {} control trials in the same state, {acked_anyway} acked without help — \
+                 but at p50 {:.0} ms and p90 {:.0} ms, so \"unnecessary\" is the wrong word \
+                 wherever that is slower than the hedged arm above",
+                pool.len(),
+                w.p50,
+                w.p90
+            ),
+        }
     }
+
     println!();
     println!("stopped after {rounds} rounds on {cut_reason}.");
     println!("conditioned trials per T (control / hedged), which is what these rows rest on:");
