@@ -231,7 +231,11 @@ pub async fn put_minted(
     // local read-back. Two loops would mean a hedge that cannot fire while a
     // read-back is waiting, which is a hedge timed by whatever else the loop
     // was doing rather than by T.
-    let budget = std::time::Instant::now() + wait.min(Duration::from_secs(180));
+    // The caller's `--timeout-secs` IS the budget for this role, not a floor
+    // under a hidden cap: with the sends inside the loop, a 180 s ceiling
+    // would stop a 200-trial run a third of the way through and report the
+    // rest as unsent. Every run states its budget on the command line.
+    let budget = std::time::Instant::now() + wait;
     let mut hedged_bytes = 0usize;
     let mut next = 0usize;
     while std::time::Instant::now() < budget {
