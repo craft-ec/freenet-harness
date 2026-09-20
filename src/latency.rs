@@ -321,6 +321,35 @@ pub(crate) fn ms_since(t: Instant) -> f64 {
 /// await never returns and the harness hangs with no error and no sample — the
 /// one failure an instrument must not have, because it is indistinguishable
 /// from slow.
+/// The same send, labelled by a key the ANSWER will name.
+///
+/// Use this wherever the response carries an identifier — a `PutResponse`
+/// carries the contract key. It is what lets the recording say WHICH operation
+/// an answer ended instead of pairing by position, which is the defect that
+/// cost harness#38 and harness#39 run 1.
+pub(crate) async fn send_req_keyed(
+    client: &mut crate::probe::Client,
+    key: &str,
+    req: ClientRequest<'static>,
+    wait: Duration,
+) -> Result<instrument::Label> {
+    let sent = client.send_keyed(req, key);
+    let id = sent.id;
+    let settled = timeout(wait, sent).await;
+    match settled {
+        Ok(r) => r.map(|()| id),
+        Err(_) => {
+            client.finish(id, instrument::vocab::Outcome::Timeout);
+            bail!(
+                "this client's send did not complete within {} s.\n  {}\n{}",
+                wait.as_secs(),
+                client.line(),
+                client.dump("the send that blocked")
+            )
+        }
+    }
+}
+
 pub(crate) async fn send_req(
     client: &mut crate::probe::Client,
     req: ClientRequest<'static>,

@@ -46,7 +46,7 @@ use freenet_stdlib::{
 use tokio::time::timeout;
 
 use crate::{
-    latency::{ms_since, send_req, Awaiting},
+    latency::{ms_since, send_req, send_req_keyed, Awaiting},
     xnode::now_ns,
 };
 
@@ -287,25 +287,33 @@ fn save_probe(client: &crate::probe::Client, out: &str, what: &'static str) {
 async fn drain_acks(
     client: &mut crate::probe::Client,
     sent_at: &HashMap<String, std::time::Instant>,
-    acked: &mut std::collections::HashSet<String>,
+    seen: &mut usize,
     ack_ms: &mut HashMap<String, f64>,
     sink: &mut impl std::io::Write,
     per_recv: Duration,
     want: usize,
 ) -> Result<bool> {
     loop {
-        if acked.len() >= want {
+        // A count is fine for deciding WHEN TO STOP WAITING. It is not fine for
+        // deciding WHAT HAPPENED — that is the distinction the previous version
+        // got wrong, filling one group's quota with another group's late acks
+        // and then reporting the first group's keys as never answered. The
+        // per-key truth comes from the recording, which pairs by the key the
+        // answer names.
+        if *seen >= want {
             return Ok(true);
         }
         match timeout(per_recv, client.recv()).await {
             Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key }))) => {
                 let k = key.id().to_string();
+                // The answer NAMED itself, so it closes the operation that
+                // asked for THIS key — whatever else is outstanding.
+                client.answered(&k);
                 if let Some(t) = sent_at.get(&k) {
-                    // The FIRST ack for a key is the answer; a repeat is the
-                    // same answer seen twice, not a later one.
-                    if acked.insert(k.clone()) {
+                    if let std::collections::hash_map::Entry::Vacant(e) = ack_ms.entry(k.clone()) {
                         let ms = t.elapsed().as_secs_f64() * 1000.0;
-                        ack_ms.insert(k.clone(), ms);
+                        e.insert(ms);
+                        *seen += 1;
                         writeln!(sink, "ACK {k} {ms:.1}")?;
                     }
                 }
@@ -395,8 +403,12 @@ pub async fn write(
     let mut sink = std::io::BufWriter::new(std::fs::File::create(out)?);
     writeln!(sink, "# ack-bound-ms {}", ack_secs * 1000)?;
     let mut sent_at: HashMap<String, std::time::Instant> = HashMap::new();
-    let mut acked: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Timing only. The PAIRING lives in the recording — a tool that keeps its
+    // own map of what was answered keeps a second account of the same facts,
+    // and the two disagreed: one run printed 99.5 % acked over records that
+    // said 92.1 %.
     let mut ack_ms: HashMap<String, f64> = HashMap::new();
+    let mut seen = 0usize;
     let mut n_blocks = 0usize;
 
     let started = std::time::Instant::now();
@@ -416,8 +428,9 @@ pub async fn write(
             let (contract, state) = mint_seeded(&code, &seed, size);
             let key = contract.key().id().to_string();
             let t_send = now_ns();
-            let _ = send_req(
+            let _ = send_req_keyed(
                 &mut client,
+                &key,
                 ClientRequest::ContractOp(ContractRequest::Put {
                     contract,
                     state: WrappedState::from(state.clone()),
@@ -454,7 +467,7 @@ pub async fn write(
         drain_acks(
             &mut client,
             &sent_at,
-            &mut acked,
+            &mut seen,
             &mut ack_ms,
             &mut sink,
             Duration::ZERO,
@@ -463,11 +476,27 @@ pub async fn write(
         .await?;
         sink.flush()?;
         *done.entry((m, arm)).or_insert(0) += 1;
+        // The progress line reads the SAME projection the per-key table will
+        // read at the end. That is the whole point: the previous version
+        // printed a count it kept itself, and printed 15/15 for a group whose
+        // own keys the file recorded as never answered. Once per group, not
+        // once per response — the projection walks the recording.
+        let counts = client.answer_counts();
+        let n_of = |a: instrument::Answered| {
+            counts
+                .iter()
+                .find(|(x, _)| *x == a)
+                .map(|(_, n)| *n)
+                .unwrap_or(0)
+        };
         println!(
-            "# group {gid} m={m} {} sent in {:.1} s — {} acked so far of {n_blocks}, {}",
+            "# group {gid} m={m} {} sent in {:.1} s — recording says {} answered, \
+             {} unanswered, {} late of {n_blocks}, {}",
             arm.tag(),
             t0.elapsed().as_secs_f64(),
-            acked.len(),
+            n_of(instrument::Answered::Once),
+            n_of(instrument::Answered::Never),
+            n_of(instrument::Answered::Late),
             client.line()
         );
     }
@@ -479,7 +508,7 @@ pub async fn write(
         2 * ack_secs
     );
     let tail = std::time::Instant::now() + Duration::from_secs(2 * ack_secs);
-    while acked.len() < n_blocks {
+    while seen < n_blocks {
         let Some(left) = tail.checked_duration_since(std::time::Instant::now()) else {
             break;
         };
@@ -487,7 +516,7 @@ pub async fn write(
         if !drain_acks(
             &mut client,
             &sent_at,
-            &mut acked,
+            &mut seen,
             &mut ack_ms,
             &mut sink,
             step,
@@ -497,32 +526,42 @@ pub async fn write(
         {
             break;
         }
-        if acked.len() >= n_blocks {
+        if seen >= n_blocks {
             break;
         }
     }
     sink.flush()?;
+    // The tallies come from the RECORDING, which pairs each answer with the
+    // key it named. The tool no longer keeps its own account of what was
+    // answered — that second account is what disagreed with the file, and
+    // craftworks-instrument#7 exists so nobody writes it again.
+    //
+    // `ack_ms` stays, because it is TIMING, not pairing: the recording has a
+    // sequence and deliberately no clock (F32), so how long an answer took is
+    // the tool's to measure. Which operation it answered is not.
     let (within_n, late_n, never_n) = {
         let bound_ms = (ack_secs * 1000) as f64;
-        let mut w = 0usize;
-        let mut l = 0usize;
-        for k in &acked {
-            match ack_ms.get(k) {
-                Some(ms) if *ms <= bound_ms => w += 1,
-                _ => l += 1,
+        let (mut w, mut l, mut n) = (0usize, 0usize, 0usize);
+        for (id, state) in client.answers() {
+            let key = client.key_of(id);
+            match state {
+                instrument::Answered::Never => n += 1,
+                // Answered, whether promptly, late by the recording's reckoning,
+                // or more than once. Which side of the ACK BOUND it fell on is a
+                // question about time, and that is what ack_ms is for.
+                _ => match key.as_deref().and_then(|k| ack_ms.get(k)) {
+                    Some(ms) if *ms <= bound_ms => w += 1,
+                    _ => l += 1,
+                },
             }
         }
-        (w, l, n_blocks - acked.len())
+        (w, l, n)
     };
 
-    // THE INVARIANT, asserted rather than trusted.
-    //
-    // The printed summary and the per-key file disagreed once already — the
-    // line said 99.5% acked over a run whose records said 92.1% — because the
-    // summary counted acks RECEIVED while the file matched acks to KEYS. The
-    // two are computed differently on purpose, so agreeing is evidence; a tool
-    // that prints a number nobody can check against its own output is how that
-    // went unnoticed for a whole run.
+    // The file is a SERIALISATION of the same projection, so this checks that
+    // writing and re-reading it is lossless — not that two independent
+    // accounts happen to agree. That check is gone because the second account
+    // is gone.
     {
         let back = parse_groups(out)?;
         let (mut w, mut l, mut n2) = (0usize, 0usize, 0usize);
@@ -535,16 +574,16 @@ pub async fn write(
         }
         if (w, l, n2) != (within_n, late_n, never_n) {
             bail!(
-                "the printed summary and the file it just wrote DISAGREE.\n  \
-                 printed: {within_n} within / {late_n} late / {never_n} never\n  \
-                 file:    {w} within / {l} late / {n2} never\n  \
-                 Every table downstream is built from the file, so a summary that \
-                 does not match it is a number nobody can check — which is exactly \
-                 how a 99.5% ack rate got reported over a run whose records said 92.1%."
+                "the file this run wrote does not read back as what the recording says.\n  \
+                 recording: {within_n} within / {late_n} late / {never_n} never\n  \
+                 file:      {w} within / {l} late / {n2} never\n  \
+                 Both derive from the same projection now, so a mismatch is a \
+                 serialisation fault in this tool, not a disagreement about what \
+                 happened."
             );
         }
         println!(
-            "# invariant: the printed summary matches the file, {} block(s) checked",
+            "# the file reads back as the recording says, {} block(s)",
             back.len()
         );
     }
