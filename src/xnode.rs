@@ -180,6 +180,7 @@ pub async fn put_minted(ws: &str, wasm: &str, minted: &str, wait: Duration) -> R
 
     // Phase 2: confirm each by bounded read-back on the OTHER connection, so a
     // read-back can never be answered by the put's own reply.
+    let mut confirmed_n = 0usize;
     for (key, size, t_send, t) in &pending {
         let mut confirmed: Option<f64> = None;
         let gate = std::time::Instant::now() + Duration::from_secs(2);
@@ -193,7 +194,10 @@ pub async fn put_minted(ws: &str, wasm: &str, minted: &str, wait: Duration) -> R
             }
         }
         match confirmed {
-            Some(ms) => println!("PUT {} {} {:.1} {}", key.id(), t_send, ms, size),
+            Some(ms) => {
+                confirmed_n += 1;
+                println!("PUT {} {} {:.1} {}", key.id(), t_send, ms, size)
+            }
             None => println!("# not readable within 2 s after send: {}", key.id()),
         }
     }
@@ -213,13 +217,16 @@ pub async fn put_minted(ws: &str, wasm: &str, minted: &str, wait: Duration) -> R
             Err(_) => break,
         }
     }
+    // Count SENDS and CONFIRMATIONS separately. They are different facts, and
+    // conflating them understated a stimulus once already: puts are issued in
+    // phase 1, so a failure during phase-2 confirmation leaves every block
+    // genuinely published while the line count suggests almost none were.
     println!(
-        "# stimulus: {} put, {} read-back confirmed; acks collected {}/{} (the rest are the \
+        "# stimulus: {} sent, {} read-back confirmed, {} acks collected (the rest are the \
          relay tail, not failures)",
-        sent.len(),
-        sent.len(),
-        acked,
-        sent.len()
+        pending.len(),
+        confirmed_n,
+        acked
     );
     let _ = writer.send(ClientRequest::Disconnect { cause: None }).await;
     let _ = confirm
@@ -410,6 +417,28 @@ async fn probe_once(
     return_code: bool,
     bound: Duration,
 ) -> Result<Option<usize>> {
+    // Drain anything still queued before sending another request.
+    //
+    // A probe that times out leaves its answer unread. Poll in a loop without
+    // draining and those answers accumulate until the socket backpressures and
+    // the next SEND blocks — which surfaces as "the node stopped accepting
+    // requests" when in fact this client stopped reading. Cheap to drain, and
+    // it also lets a late answer count: if the queued reply names the key we
+    // are asking about, that IS the hit.
+    let mut queued_hit = None;
+    while let Ok(Ok(msg)) = timeout(Duration::from_millis(0), client.recv()).await {
+        if let HostResponse::ContractResponse(ContractResponse::GetResponse {
+            key: k, state, ..
+        }) = msg
+        {
+            if k.id() == id {
+                queued_hit = Some(state.as_ref().len());
+            }
+        }
+    }
+    if queued_hit.is_some() {
+        return Ok(queued_hit);
+    }
     send_req(
         client,
         ClientRequest::ContractOp(ContractRequest::Get {
