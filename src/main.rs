@@ -2,6 +2,7 @@
 //! probes delegate capabilities.
 
 mod bag;
+mod group;
 mod latency;
 mod pack;
 mod putshape;
@@ -172,6 +173,37 @@ enum Cmd {
         /// REQUIRED — see `bag --expect-sha`.
         #[arg(long)]
         expect_sha: String,
+    },
+    /// How long until k of n pieces are readable on ANOTHER node, with our
+    /// strategies on (BASELINE) and off (RAW). A timing stand-in for erasure.
+    Group {
+        #[arg(long, default_value = "../freenet-contracts/build/block.wasm")]
+        wasm: String,
+        /// The node to READ from. The writes go to --ws.
+        #[arg(long)]
+        read_ws: String,
+        /// Bytes per piece.
+        #[arg(long, default_value_t = 16384)]
+        size: usize,
+        /// Pieces per group.
+        #[arg(long, default_value_t = 12)]
+        n: usize,
+        /// How many of them a reader needs.
+        #[arg(long, default_value_t = 9)]
+        k: usize,
+        /// Groups per arm.
+        #[arg(long, default_value_t = 10)]
+        groups: usize,
+        /// One BASELINE read attempt, in ms. Also sets the resolution of the
+        /// clock, which the run prints.
+        #[arg(long, default_value_t = 1500)]
+        attempt_ms: u64,
+        /// Deadline for one group; what is not readable by then is `not within T`.
+        #[arg(long, default_value_t = 60)]
+        group_secs: u64,
+        /// Total seconds for the whole run; 0 turns it off.
+        #[arg(long, default_value_t = 600)]
+        budget_secs: u64,
     },
     /// The same payload put as ONE contract or as k in parallel: which shape
     /// commits sooner, and what each costs in bytes.
@@ -656,6 +688,33 @@ async fn main() -> Result<()> {
         }
         Cmd::Pack { wasm, expect_sha } => {
             pack::run(&ws, &wasm, &expect_sha, wait).await?;
+        }
+        Cmd::Group {
+            wasm,
+            read_ws,
+            size,
+            n,
+            k,
+            groups,
+            attempt_ms,
+            group_secs,
+            budget_secs,
+        } => {
+            group::run(
+                &ws,
+                &read_ws,
+                &wasm,
+                group::Opts {
+                    size,
+                    n,
+                    k,
+                    groups,
+                    attempt_ms,
+                    group_secs,
+                    budget_secs,
+                },
+            )
+            .await?;
         }
         Cmd::PutShape {
             wasm,
