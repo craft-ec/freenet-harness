@@ -138,6 +138,9 @@ enum Cmd {
         /// File of PUT lines produced by the write role.
         #[arg(long, default_value = "keys.txt")]
         keys: String,
+        /// The reader's log, for `--role pair`.
+        #[arg(long, default_value = "reads.txt")]
+        reads: String,
         #[arg(long, default_value_t = 20)]
         samples: usize,
         #[arg(long, value_delimiter = ',', default_values_t = [1024, 16384, 262144])]
@@ -536,6 +539,7 @@ async fn main() -> Result<()> {
             role,
             wasm,
             keys,
+            reads,
             samples,
             sizes,
             return_code,
@@ -550,6 +554,7 @@ async fn main() -> Result<()> {
                 &sizes,
                 xnode::ReadOpts {
                     keys,
+                    reads,
                     return_code,
                     probe_ms,
                     limit_secs,

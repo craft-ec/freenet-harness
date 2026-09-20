@@ -1,5 +1,19 @@
 //! `xnode`: how long until a block written on one node is readable on another?
 //!
+//! WORKAROUND(freenet-core#5446): this module never gates on a PUT
+//! acknowledgement. The relay's flat 60 s downstream wait lands on roughly one
+//! put in 10-50, so waiting for every ack costs minutes per run for
+//! information a bounded read-back gives in ~200 ms. See
+//! craftworks-docs/docs/WORKAROUNDS.md (W1).
+//!
+//! WHEN THE UPSTREAM FIX SHIPS: the read-back gate STAYS — it is a stronger
+//! statement than the ack (the node can SERVE the block, not merely that the
+//! operation finished) and it is what makes `--local` runs finish in seconds.
+//! Parallel puts STAY: a batch should pay any tail once, not N times.
+//! `--local` STAYS: functional round-trips have no business on the network.
+//! What GOES is the 90 s ack-collection deadline and the "acks collected M/N"
+//! column, which exist only to measure a tail we expect to disappear.
+//!
 //! Local readability (#6) is a property of the writer. This is the number the
 //! write design actually needs: when can a DIFFERENT node serve the block.
 //!
@@ -25,7 +39,7 @@ use tokio::time::timeout;
 
 use crate::{
     latency::{ms_since, send_req},
-    stats::{kib, Summary},
+    stats::{kib, Summary, Table},
 };
 
 fn now_ns() -> u128 {
@@ -217,6 +231,14 @@ pub async fn put_minted(ws: &str, wasm: &str, minted: &str, wait: Duration) -> R
             Err(_) => break,
         }
     }
+    // The run asserts its own stimulus rather than leaving a later reader to
+    // notice. `expected` is the number of MINT lines; if fewer were sent, no
+    // result derived from this run means anything.
+    let expected = text.lines().filter(|l| l.starts_with("MINT ")).count();
+    if let Err(e) = stimulus_ok(expected, pending.len(), confirmed_n) {
+        bail!("{e}");
+    }
+
     // Count SENDS and CONFIRMATIONS separately. They are different facts, and
     // conflating them understated a stimulus once already: puts are issued in
     // phase 1, so a failure during phase-2 confirmation leaves every block
@@ -458,6 +480,142 @@ async fn probe_once(
     }
 }
 
+/// One writer line: the key, when it was SENT, and the local confirm time.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Send {
+    pub key: String,
+    pub sent_ns: u128,
+    pub confirm_ms: f64,
+    pub size: usize,
+}
+
+/// One reader line: the key and the absolute time this node first served it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Hit {
+    pub key: String,
+    pub size: usize,
+    pub at_ms: f64,
+}
+
+/// What pairing produced, including everything it REFUSED.
+#[derive(Debug, Default, PartialEq)]
+pub struct Paired {
+    /// (size, delta_ms) for every sound pair.
+    pub deltas: Vec<(usize, f64)>,
+    /// Hits whose delta came out negative — impossible, so refused.
+    pub refused_negative: usize,
+    /// Hits naming a key the writer never reported sending.
+    pub unmatched: usize,
+}
+
+/// Pair reader hits against writer sends.
+///
+/// A negative delta means the reader served a block before the writer sent it,
+/// which cannot happen — it means the two sides are describing different runs.
+/// This has occurred: a phase-2 failure left blocks published while the PUT
+/// line count reported almost none, and pairing those hits against a LATER
+/// re-run's send times produced deltas of -71 s. Refusing them (and counting
+/// the refusals) is what turns that from a published number into a caught bug.
+pub fn pair(sends: &[Send], hits: &[Hit]) -> Paired {
+    let mut out = Paired::default();
+    for h in hits {
+        match sends.iter().find(|s| s.key == h.key) {
+            None => out.unmatched += 1,
+            Some(s) => {
+                let d = h.at_ms - (s.sent_ns as f64) / 1e6;
+                if d < 0.0 {
+                    out.refused_negative += 1;
+                } else {
+                    out.deltas.push((h.size, d));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Does a run's stimulus match what was asked for?
+///
+/// SENDS are the stimulus, not confirmations: puts are issued in one phase and
+/// confirmed in another, so a confirmation failure leaves every block genuinely
+/// published while the confirmed count reports almost none. Asserting on the
+/// wrong one is how a real stimulus got reported as absent.
+pub fn stimulus_ok(expected: usize, sent: usize, confirmed: usize) -> Result<(), String> {
+    if sent < expected {
+        return Err(format!(
+            "stimulus incomplete: {sent} sent, expected {expected} \
+             (confirmed {confirmed} — confirmations are NOT the stimulus)"
+        ));
+    }
+    Ok(())
+}
+
+/// Pair a writer's PUT lines against a reader's READ lines and print the
+/// table — including everything refused, so a reader cannot quietly drop the
+/// impossible values that reveal a mispaired run.
+pub fn pair_files(put_file: &str, read_file: &str) -> Result<()> {
+    let put = std::fs::read_to_string(put_file)
+        .map_err(|e| anyhow!("{put_file}: {e} — run the put role first"))?;
+    let read = std::fs::read_to_string(read_file)
+        .map_err(|e| anyhow!("{read_file}: {e} — run the read role first"))?;
+    let sends: Vec<Send> = put
+        .lines()
+        .filter_map(|l| {
+            let f: Vec<&str> = l.split_whitespace().collect();
+            (f.first() == Some(&"PUT") && f.len() >= 5).then(|| Send {
+                key: f[1].to_string(),
+                sent_ns: f[2].parse().unwrap_or(0),
+                confirm_ms: f[3].parse().unwrap_or(0.0),
+                size: f[4].parse().unwrap_or(0),
+            })
+        })
+        .collect();
+    let hits: Vec<Hit> = read
+        .lines()
+        .filter_map(|l| {
+            let f: Vec<&str> = l.split_whitespace().collect();
+            (f.first() == Some(&"READ") && f.len() >= 4).then(|| Hit {
+                key: f[1].to_string(),
+                size: f[2].parse().unwrap_or(0),
+                at_ms: f[3].parse().unwrap_or(0.0),
+            })
+        })
+        .collect();
+    let p = pair(&sends, &hits);
+    println!(
+        "pairs={} refused_negative={} unmatched={}  (sends={} hits={})",
+        p.deltas.len(),
+        p.refused_negative,
+        p.unmatched,
+        sends.len(),
+        hits.len()
+    );
+    if p.refused_negative > 0 {
+        println!(
+            "  WARNING: {} hit(s) preceded their send. That is impossible, so these two files \
+             describe different runs — the table below is NOT a measurement of this run.",
+            p.refused_negative
+        );
+    }
+    let mut by: std::collections::BTreeMap<usize, Vec<f64>> = Default::default();
+    for (size, d) in &p.deltas {
+        by.entry(*size).or_default().push(*d);
+    }
+    let mut t = Table::new(["size", "n", "readable elsewhere p50", "min", "max"]);
+    for (size, v) in &by {
+        let s = Summary::of(v);
+        t.row([
+            kib(*size),
+            v.len().to_string(),
+            s.map(|x| format!("{:.1}", x.p50)).unwrap_or("-".into()),
+            s.map(|x| format!("{:.1}", x.min)).unwrap_or("-".into()),
+            s.map(|x| format!("{:.1}", x.max)).unwrap_or("-".into()),
+        ]);
+    }
+    print!("{t}");
+    Ok(())
+}
+
 /// Print this machine's clock against a reference, so a cross-machine
 /// duration can be corrected rather than quietly trusted.
 pub fn stamp() -> Result<()> {
@@ -469,6 +627,8 @@ pub fn stamp() -> Result<()> {
 /// argument-count lint rather than growing a tenth positional parameter.
 pub struct ReadOpts {
     pub keys: String,
+    /// The reader's log, for the `pair` role.
+    pub reads: String,
     pub return_code: bool,
     pub probe_ms: u64,
     pub limit_secs: u64,
@@ -497,7 +657,86 @@ pub async fn run(
             )
             .await
         }
+        "pair" => pair_files(&opts.keys, &opts.reads),
         "clock" => stamp(),
         other => bail!("unknown role {other}; expected write, read or clock"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn s(key: &str, sent_ns: u128) -> Send {
+        Send {
+            key: key.into(),
+            sent_ns,
+            confirm_ms: 100.0,
+            size: 1024,
+        }
+    }
+    fn h(key: &str, at_ms: f64) -> Hit {
+        Hit {
+            key: key.into(),
+            size: 1024,
+            at_ms,
+        }
+    }
+
+    #[test]
+    fn a_sound_pair_yields_the_elapsed_time() {
+        let p = pair(&[s("a", 1_000_000_000)], &[h("a", 1500.0)]);
+        assert_eq!(p.deltas, vec![(1024, 500.0)]);
+        assert_eq!(p.refused_negative, 0);
+    }
+
+    /// The defect this function exists for: a hit that precedes its send is
+    /// impossible, so it must be refused and COUNTED — never reported as a
+    /// measurement. The old pairing published -71735 ms.
+    #[test]
+    fn a_negative_delta_is_refused_not_reported() {
+        let p = pair(&[s("a", 2_000_000_000)], &[h("a", 1000.0)]);
+        assert!(p.deltas.is_empty(), "a negative delta must not be reported");
+        assert_eq!(p.refused_negative, 1, "and it must be counted");
+    }
+
+    /// Half a pair is not a measurement.
+    #[test]
+    fn a_hit_with_no_send_is_unmatched_not_zero() {
+        let p = pair(&[s("a", 1_000_000_000)], &[h("b", 1500.0)]);
+        assert!(p.deltas.is_empty());
+        assert_eq!(p.unmatched, 1);
+        let none = pair(&[s("a", 1_000_000_000)], &[]);
+        assert_eq!(none, Paired::default());
+    }
+
+    /// Mixed input: the sound pair survives, the impossible one does not, and
+    /// neither hides the other.
+    #[test]
+    fn refusals_do_not_suppress_sound_pairs() {
+        let p = pair(
+            &[s("a", 1_000_000_000), s("b", 5_000_000_000)],
+            &[h("a", 1200.0), h("b", 1000.0), h("zz", 9.0)],
+        );
+        assert_eq!(p.deltas, vec![(1024, 200.0)]);
+        assert_eq!(p.refused_negative, 1);
+        assert_eq!(p.unmatched, 1);
+    }
+
+    /// The stimulus assertion keys on SENDS. A run that sent everything but
+    /// confirmed almost nothing has a complete stimulus; the old assertion
+    /// looked at confirmations and called it absent.
+    #[test]
+    fn stimulus_keys_on_sends_not_confirmations() {
+        assert!(stimulus_ok(21, 21, 3).is_ok(), "21 sent IS the stimulus");
+        let e = stimulus_ok(21, 3, 3).unwrap_err();
+        assert!(
+            e.contains("3 sent"),
+            "must name what was actually sent: {e}"
+        );
+        assert!(
+            e.contains("confirmations are NOT the stimulus"),
+            "must say why: {e}"
+        );
     }
 }
