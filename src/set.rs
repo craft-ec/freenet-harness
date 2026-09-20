@@ -87,7 +87,7 @@ fn verdict(b: bool) -> &'static str {
     }
 }
 
-pub async fn run(ws: &str, wasm: &str, expect_sha: Option<&str>, wait: Duration) -> Result<()> {
+pub async fn run(ws: &str, wasm: &str, expect_sha: &str, wait: Duration) -> Result<()> {
     let bytes = crate::wasm_check::load(wasm, expect_sha)?;
     let code = Arc::new(ContractCode::from(bytes));
 
