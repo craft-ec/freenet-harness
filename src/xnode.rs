@@ -39,7 +39,7 @@ use tokio::time::timeout;
 
 use crate::{
     latency::{ms_since, progress_pub, send_req, send_req_ctx},
-    stats::{kib, Summary, Table},
+    stats::{kib, Grid, Summary, Table},
 };
 
 fn now_ns() -> u128 {
@@ -986,7 +986,7 @@ pub fn stimulus_ok(expected: usize, sent: usize, confirmed: usize) -> Result<(),
 /// Pair a writer's PUT lines against a reader's READ lines and print the
 /// table — including everything refused, so a reader cannot quietly drop the
 /// impossible values that reveal a mispaired run.
-pub fn pair_files(put_file: &str, read_file: &str, margin_ms: f64) -> Result<()> {
+pub fn pair_files(put_file: &str, read_file: &str, margin_ms: f64, grid_ms: f64) -> Result<()> {
     let put = std::fs::read_to_string(put_file)
         .map_err(|e| anyhow!("{put_file}: {e} — run the put role first"))?;
     let read = std::fs::read_to_string(read_file)
@@ -1056,7 +1056,18 @@ pub fn pair_files(put_file: &str, read_file: &str, margin_ms: f64) -> Result<()>
         ]);
     }
     print!("{t}");
-    report_hedge(&p.deltas, margin_ms);
+    if grid_ms > 0.0 {
+        let g = Grid { ms: grid_ms };
+        println!("{}", g.line());
+        for (size, v) in &by {
+            if let Some(s) = Summary::of(v) {
+                if let Some(note) = g.unresolved(&kib(*size), &s) {
+                    println!("  {note}");
+                }
+            }
+        }
+    }
+    report_hedge(&p.deltas, margin_ms, grid_ms);
     Ok(())
 }
 
@@ -1065,7 +1076,7 @@ pub fn pair_files(put_file: &str, read_file: &str, margin_ms: f64) -> Result<()>
 ///
 /// Silent when the run had no arms, because a file from a no-hedge run has
 /// nothing to say about a hedge and a table of dashes reads like one that does.
-pub fn report_hedge(rows: &[Joined], margin_ms: f64) {
+pub fn report_hedge(rows: &[Joined], margin_ms: f64, grid_ms: f64) {
     if !rows.iter().any(|r| r.unacked_at_t.is_some()) {
         return;
     }
@@ -1107,6 +1118,21 @@ pub fn report_hedge(rows: &[Joined], margin_ms: f64) {
         ]);
     }
     print!("{t}");
+    if grid_ms > 0.0 {
+        let g = Grid { ms: grid_ms };
+        for arm in [Arm::Control, Arm::Hedge] {
+            let c = conditional(rows, arm);
+            if let Some(s) = Summary::of(&c.far) {
+                if let Some(note) = g.unresolved(&format!("{} far-read", arm.as_str()), &s) {
+                    println!("  {note}");
+                }
+            }
+        }
+        println!(
+            "  the ack column is on the WRITER's own clock and is not on this grid; the \
+             far-read column is."
+        );
+    }
     if let Verdict::NoFinding { smaller_arm } = verdict(rows) {
         println!(
             "NO FINDING: the smaller conditioned arm has {smaller_arm} trials, below the floor \
@@ -1172,6 +1198,11 @@ pub struct ReadOpts {
     /// assumed: the `clock` role prints each machine's stamp, and the run that
     /// produced these files reports what it could bound them to.
     pub clock_margin_ms: f64,
+    /// The READER's probe grid, in ms, which it printed at the top of its own
+    /// output: `rounds_per_cycle * probe_ms`. A far-node time is resolved to
+    /// this, not to the probe period, and a series whose whole spread fits
+    /// inside one step measured the instrument.
+    pub grid_ms: f64,
     /// The reader's log, for the `pair` role.
     pub reads: String,
     pub return_code: bool,
@@ -1211,7 +1242,7 @@ pub async fn run(
             )
             .await
         }
-        "pair" => pair_files(&opts.keys, &opts.reads, opts.clock_margin_ms),
+        "pair" => pair_files(&opts.keys, &opts.reads, opts.clock_margin_ms, opts.grid_ms),
         "clock" => stamp(),
         other => bail!("unknown role {other}; expected write, read or clock"),
     }

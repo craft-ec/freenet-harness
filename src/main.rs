@@ -374,6 +374,12 @@ enum Cmd {
         /// both machines; do not leave it at 0 for a cross-machine run.
         #[arg(long, default_value_t = 0.0)]
         clock_margin_ms: f64,
+        /// The READER's probe grid in ms, as it printed at the top of its own
+        /// output. A far-node time is resolved to this, not to the probe
+        /// period, and `pair` flags any series whose whole spread fits inside
+        /// one step — that series measured the instrument.
+        #[arg(long, default_value_t = 0.0)]
+        grid_ms: f64,
         #[arg(long, default_value_t = 20)]
         samples: usize,
         #[arg(long, value_delimiter = ',', default_values_t = [1024, 16384, 262144])]
@@ -781,6 +787,7 @@ async fn main() -> Result<()> {
             reads,
             hedge_secs,
             clock_margin_ms,
+            grid_ms,
             samples,
             sizes,
             return_code,
@@ -798,6 +805,7 @@ async fn main() -> Result<()> {
                     reads,
                     hedge_secs,
                     clock_margin_ms,
+                    grid_ms,
                     return_code,
                     probe_ms,
                     limit_secs,
