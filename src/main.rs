@@ -366,6 +366,14 @@ enum Cmd {
         /// a control in the same state at the same instant (freenet-harness#11).
         #[arg(long, default_value_t = 0.0)]
         hedge_secs: f64,
+        /// How far apart the writer's and the reader's clocks may be, in ms.
+        ///
+        /// The `pair` role needs it: the ack is timed on the writer's clock
+        /// and the far read on the reader's, so an ordering inside this margin
+        /// is the clocks, not the network. Measure it with the `clock` role on
+        /// both machines; do not leave it at 0 for a cross-machine run.
+        #[arg(long, default_value_t = 0.0)]
+        clock_margin_ms: f64,
         #[arg(long, default_value_t = 20)]
         samples: usize,
         #[arg(long, value_delimiter = ',', default_values_t = [1024, 16384, 262144])]
@@ -772,6 +780,7 @@ async fn main() -> Result<()> {
             keys,
             reads,
             hedge_secs,
+            clock_margin_ms,
             samples,
             sizes,
             return_code,
@@ -788,6 +797,7 @@ async fn main() -> Result<()> {
                     keys,
                     reads,
                     hedge_secs,
+                    clock_margin_ms,
                     return_code,
                     probe_ms,
                     limit_secs,

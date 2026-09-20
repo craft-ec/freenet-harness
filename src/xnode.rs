@@ -850,25 +850,44 @@ pub fn conditional(rows: &[Joined], arm: Arm) -> Conditioned {
 pub struct Proxy {
     /// Pairs where both an ack and a far-node read exist.
     pub both: usize,
-    /// ...of which the FAR node served the block before the ack arrived.
+    /// ...of which the FAR node served the block CLEARLY before the ack.
     pub far_first: usize,
+    /// ...and the other way round.
+    pub ack_first: usize,
+    /// ...and those whose order the clock bound cannot settle.
+    pub within_margin: usize,
     /// `ack_ms - far_ms` for those pairs: positive means the far node was
     /// first, so the ack told the writer nothing it did not already have.
     pub gaps: Vec<f64>,
     /// Readable on the far node, never acknowledged. The ack cannot be a
-    /// precondition for these.
+    /// precondition for these, and no clock correction can change that.
     pub far_without_ack: usize,
 }
 
-pub fn proxy(rows: &[Joined]) -> Proxy {
+/// Which came first, the acknowledgement or the far node serving the block?
+///
+/// `margin_ms` is the clock bound, and it is not optional. The ack is timed on
+/// the WRITER's clock and the far read on the READER's, so their difference
+/// carries whatever the two clocks disagree by — and a run that reported "the
+/// far node was first" for a 40 ms gap between two machines synchronised to a
+/// few hundred milliseconds would be reporting the clocks. Pairs inside the
+/// margin are counted as undecided rather than assigned to a side.
+///
+/// `far_without_ack` needs no margin at all: no clock correction turns an
+/// acknowledgement that never arrived into one that did.
+pub fn proxy(rows: &[Joined], margin_ms: f64) -> Proxy {
     let mut out = Proxy::default();
     for r in rows {
         match r.ack_ms {
             None => out.far_without_ack += 1,
             Some(a) => {
                 out.both += 1;
-                if r.far_ms < a {
+                if r.far_ms + margin_ms < a {
                     out.far_first += 1;
+                } else if a + margin_ms < r.far_ms {
+                    out.ack_first += 1;
+                } else {
+                    out.within_margin += 1;
                 }
                 out.gaps.push(a - r.far_ms);
             }
@@ -896,7 +915,7 @@ pub fn stimulus_ok(expected: usize, sent: usize, confirmed: usize) -> Result<(),
 /// Pair a writer's PUT lines against a reader's READ lines and print the
 /// table — including everything refused, so a reader cannot quietly drop the
 /// impossible values that reveal a mispaired run.
-pub fn pair_files(put_file: &str, read_file: &str) -> Result<()> {
+pub fn pair_files(put_file: &str, read_file: &str, margin_ms: f64) -> Result<()> {
     let put = std::fs::read_to_string(put_file)
         .map_err(|e| anyhow!("{put_file}: {e} — run the put role first"))?;
     let read = std::fs::read_to_string(read_file)
@@ -966,7 +985,7 @@ pub fn pair_files(put_file: &str, read_file: &str) -> Result<()> {
         ]);
     }
     print!("{t}");
-    report_hedge(&p.deltas);
+    report_hedge(&p.deltas, margin_ms);
     Ok(())
 }
 
@@ -975,7 +994,7 @@ pub fn pair_files(put_file: &str, read_file: &str) -> Result<()> {
 ///
 /// Silent when the run had no arms, because a file from a no-hedge run has
 /// nothing to say about a hedge and a table of dashes reads like one that does.
-pub fn report_hedge(rows: &[Joined]) {
+pub fn report_hedge(rows: &[Joined], margin_ms: f64) {
     if !rows.iter().any(|r| r.unacked_at_t.is_some()) {
         return;
     }
@@ -1034,23 +1053,22 @@ pub fn report_hedge(rows: &[Joined]) {
         );
     }
 
-    let x = proxy(rows);
+    let x = proxy(rows, margin_ms);
     println!();
     println!("DOES THE ACK PREDICT FAR-NODE READABILITY?");
     println!(
-        "  readable elsewhere with NO acknowledgement at all: {} of {} pairs",
+        "  clock margin: ±{margin_ms:.0} ms. The ack is on the writer's clock and the far read \
+         on the reader's, so an order inside this is not decided."
+    );
+    println!(
+        "  readable elsewhere with NO acknowledgement at all: {} of {} pairs  \
+         (no clock correction changes these)",
         x.far_without_ack,
         rows.len()
     );
     println!(
-        "  of the {} pairs with both, the far node served it FIRST in {} ({:.0} %)",
-        x.both,
-        x.far_first,
-        if x.both > 0 {
-            100.0 * x.far_first as f64 / x.both as f64
-        } else {
-            0.0
-        }
+        "  of the {} pairs with both: far node first {}, ack first {}, undecided {}",
+        x.both, x.far_first, x.ack_first, x.within_margin
     );
     println!(
         "  ack - readable-elsewhere (ms, positive = the far node was first): p50 {} p90 {}",
@@ -1079,6 +1097,10 @@ pub struct ReadOpts {
     /// T for the hedge, in seconds; 0 turns it off and the run is exactly the
     /// one that existed before arms did.
     pub hedge_secs: f64,
+    /// How far apart the two machines' clocks may be, in ms. Measured, never
+    /// assumed: the `clock` role prints each machine's stamp, and the run that
+    /// produced these files reports what it could bound them to.
+    pub clock_margin_ms: f64,
     /// The reader's log, for the `pair` role.
     pub reads: String,
     pub return_code: bool,
@@ -1118,7 +1140,7 @@ pub async fn run(
             )
             .await
         }
-        "pair" => pair_files(&opts.keys, &opts.reads),
+        "pair" => pair_files(&opts.keys, &opts.reads, opts.clock_margin_ms),
         "clock" => stamp(),
         other => bail!("unknown role {other}; expected write, read or clock"),
     }
@@ -1274,11 +1296,41 @@ mod tests {
             // readable elsewhere, never acked at all
             j(Arm::Hedge, Some(true), true, 700.0, None),
         ];
-        let x = proxy(&rows);
+        let x = proxy(&rows, 0.0);
         assert_eq!(x.both, 2);
         assert_eq!(x.far_first, 1);
         assert_eq!(x.far_without_ack, 1);
         assert_eq!(x.gaps, vec![1700.0, -3100.0]);
+    }
+
+    /// The clock margin must decide the ORDER, not decorate it. A gap smaller
+    /// than the two machines' disagreement is the clocks, and assigning it to
+    /// a side is reporting them as if they were the network.
+    #[test]
+    fn an_ordering_inside_the_clock_margin_is_undecided() {
+        // 40 ms apart, on two clocks bounded to 300 ms.
+        let rows = vec![j(Arm::Control, Some(true), false, 100.0, Some(140.0))];
+        let tight = proxy(&rows, 0.0);
+        assert_eq!(tight.far_first, 1, "with no margin it would be called");
+        let honest = proxy(&rows, 300.0);
+        assert_eq!(honest.far_first, 0);
+        assert_eq!(honest.ack_first, 0);
+        assert_eq!(honest.within_margin, 1);
+        // The control: a gap well outside the margin is still decided, so the
+        // margin is not simply refusing to answer.
+        let wide = vec![j(Arm::Control, Some(true), false, 100.0, Some(5000.0))];
+        assert_eq!(proxy(&wide, 300.0).far_first, 1);
+    }
+
+    /// A block readable elsewhere that was never acknowledged needs no clock
+    /// correction at all, so no margin may hide it.
+    #[test]
+    fn a_far_read_with_no_ack_survives_any_margin() {
+        let rows = vec![j(Arm::Hedge, Some(true), true, 700.0, None)];
+        for margin in [0.0, 300.0, 60_000.0] {
+            assert_eq!(proxy(&rows, margin).far_without_ack, 1, "margin {margin}");
+            assert_eq!(proxy(&rows, margin).both, 0);
+        }
     }
 
     /// The floor decides, and it decides at the boundary. One trial short of
