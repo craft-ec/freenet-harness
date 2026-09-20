@@ -2,6 +2,7 @@
 //! probes delegate capabilities.
 
 mod bag;
+mod batchblock;
 mod group;
 mod hedge;
 mod kill9;
@@ -159,6 +160,25 @@ enum Cmd {
         /// the same contract; random when omitted.
         #[arg(long)]
         salt: Option<String>,
+    },
+    /// Re-measure #32: does a batch of sends still block the client API?
+    ///
+    /// Sends N requests with NO interleaved recv, for keys that cannot exist,
+    /// and counts sends until one blocks. The control sends one at a time.
+    BatchBlock {
+        /// Batch sizes to try, as the issue specifies (8-32).
+        #[arg(long, value_delimiter = ',', default_value = "8,32")]
+        batches: Vec<usize>,
+        /// Sends per arm before calling it completed.
+        #[arg(long, default_value_t = 10_000)]
+        sends: u64,
+        /// Deadline on ONE send. A block is what this measures, so it must
+        /// never be waited on indefinitely.
+        #[arg(long, default_value_t = 10)]
+        send_wait_secs: u64,
+        /// Total budget per arm, so the run cannot become the thing it measures.
+        #[arg(long, default_value_t = 180)]
+        budget_secs: u64,
     },
     /// Bag contract live-node round trip (#7). Runs in --local.
     Bag {
@@ -935,6 +955,14 @@ async fn main() -> Result<()> {
                 wait,
             )
             .await?;
+        }
+        Cmd::BatchBlock {
+            batches,
+            sends,
+            send_wait_secs,
+            budget_secs,
+        } => {
+            batchblock::run(&ws, batches, sends, send_wait_secs, budget_secs).await?;
         }
         Cmd::Bag {
             wasm,
