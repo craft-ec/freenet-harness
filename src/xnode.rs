@@ -42,7 +42,7 @@ use crate::{
     stats::{kib, Grid, Summary, Table},
 };
 
-fn now_ns() -> u128 {
+pub(crate) fn now_ns() -> u128 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
@@ -55,7 +55,7 @@ fn now_ns() -> u128 {
 /// Storing the state as hex made a 21-block file 3.9 MB, most of it three
 /// 256 KiB bodies written twice over. The seed reproduces the same bytes on
 /// both phases at 32 characters.
-fn body_from_seed(seed: &[u8; 16], size: usize) -> Vec<u8> {
+pub(crate) fn body_from_seed(seed: &[u8; 16], size: usize) -> Vec<u8> {
     let mut out = Vec::with_capacity(size);
     let mut counter: u64 = 0;
     while out.len() < size {
@@ -72,7 +72,10 @@ fn body_from_seed(seed: &[u8; 16], size: usize) -> Vec<u8> {
 /// Mint a Block whose key nothing has seen: the body is derived from a fresh
 /// random seed, so the key is a fresh hash. This is the writer's whole
 /// contribution to "cold".
-fn mint(code: &Arc<ContractCode<'static>>, size: usize) -> Result<(ContractContainer, Vec<u8>)> {
+pub(crate) fn mint(
+    code: &Arc<ContractCode<'static>>,
+    size: usize,
+) -> Result<(ContractContainer, Vec<u8>)> {
     let mut seed = [0u8; 16];
     getrandom::getrandom(&mut seed)?;
     let body = body_from_seed(&seed, size);

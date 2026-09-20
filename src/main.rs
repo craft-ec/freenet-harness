@@ -7,6 +7,7 @@ mod hedge;
 mod kill9;
 mod latency;
 mod pack;
+mod parity;
 mod probe;
 mod putshape;
 mod register;
@@ -346,6 +347,52 @@ enum Cmd {
     },
     /// Cross-node: write blocks on one node, then measure on ANOTHER how
     /// long until each is readable there.
+    /// Can a reader get ANY m of an (m+3) group? The group rate §7's reader
+    /// actually experiences, which a per-block rate cannot be turned into.
+    Parity {
+        /// write | read | reput | score
+        #[arg(long)]
+        role: String,
+        #[arg(long, default_value = "../freenet-contracts/build/block.wasm")]
+        wasm: String,
+        /// Group sizes to measure, as data-block counts.
+        #[arg(long, value_delimiter = ',', default_values_t = [7usize, 9, 12])]
+        m: Vec<usize>,
+        /// Scored groups per m. The floor the verdict needs.
+        #[arg(long, default_value_t = 60)]
+        groups: usize,
+        /// Extra groups per m read with their m DATA members only.
+        ///
+        /// The cost arm. It cannot share groups with the scored arm: a second
+        /// read of a group already read comes warm from the far node (F33).
+        #[arg(long, default_value_t = 20)]
+        control_groups: usize,
+        #[arg(long, default_value_t = 3)]
+        parity: usize,
+        #[arg(long, default_value_t = 1024)]
+        size: usize,
+        /// An ack later than this is LATE; twice this and it is NEVER.
+        #[arg(long, default_value_t = 30)]
+        ack_secs: u64,
+        /// Give up asking for a key after this long. A MISS here is 'not
+        /// within the bound', never 'never'.
+        #[arg(long, default_value_t = 120)]
+        per_key_secs: u64,
+        #[arg(long, default_value_t = 500)]
+        probe_ms: u64,
+        #[arg(long, default_value = "groups.txt")]
+        groups_file: String,
+        #[arg(long, default_value = "reads.txt")]
+        reads_file: String,
+        /// The reads of the re-put keys, for `score`.
+        #[arg(long)]
+        reput_file: Option<String>,
+        #[arg(long, default_value = "out.txt")]
+        out: String,
+        /// Far backstop, never the thing being waited on.
+        #[arg(long, default_value_t = 240)]
+        budget_mins: u64,
+    },
     Xnode {
         /// write | read | clock
         #[arg(long)]
@@ -808,6 +855,51 @@ async fn main() -> Result<()> {
             )
             .await?;
         }
+        Cmd::Parity {
+            role,
+            wasm,
+            m,
+            groups,
+            control_groups,
+            parity,
+            size,
+            ack_secs,
+            per_key_secs,
+            probe_ms,
+            groups_file,
+            reads_file,
+            reput_file,
+            out,
+            budget_mins,
+        } => match role.as_str() {
+            "write" => {
+                crate::parity::write(
+                    &ws,
+                    &wasm,
+                    &m,
+                    groups,
+                    control_groups,
+                    parity,
+                    size,
+                    ack_secs,
+                    &out,
+                    budget_mins,
+                )
+                .await?
+            }
+            "read" => crate::parity::read(&ws, &groups_file, per_key_secs, probe_ms, &out).await?,
+            "reput" => {
+                crate::parity::reput(&ws, &wasm, &groups_file, &reads_file, ack_secs, &out).await?
+            }
+            "score" => crate::parity::score(
+                &groups_file,
+                &reads_file,
+                reput_file.as_deref(),
+                &[5.0, 30.0, 120.0],
+                groups,
+            )?,
+            other => anyhow::bail!("unknown --role {other}: write | read | reput | score"),
+        },
         Cmd::Xnode {
             role,
             wasm,
