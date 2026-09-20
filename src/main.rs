@@ -5,6 +5,7 @@ mod latency;
 mod stats;
 mod validate_cost;
 mod watch;
+mod xnode;
 
 use std::{
     sync::Arc,
@@ -30,6 +31,14 @@ struct Cli {
         default_value = "ws://127.0.0.1:7509/v1/contract/command?encodingProtocol=native"
     )]
     ws: String,
+    /// Target the LOCAL-mode node (port 7609) instead of the network node.
+    ///
+    /// Anything asking "does the contract behave" belongs here: local mode
+    /// pays ~30 ms per put and has no relay tail, so a functional round-trip
+    /// finishes in seconds. Network mode is for propagation, latency and byte
+    /// measurements only — and every table says which one produced it.
+    #[arg(long, default_value_t = false)]
+    local: bool,
     #[arg(long, default_value_t = 120)]
     timeout_secs: u64,
     #[command(subcommand)]
@@ -117,6 +126,34 @@ enum Cmd {
         /// the same contract; random when omitted.
         #[arg(long)]
         salt: Option<String>,
+    },
+    /// Cross-node: write blocks on one node, then measure on ANOTHER how
+    /// long until each is readable there.
+    Xnode {
+        /// write | read | clock
+        #[arg(long)]
+        role: String,
+        #[arg(long, default_value = "../freenet-contracts/build/block.wasm")]
+        wasm: String,
+        /// File of PUT lines produced by the write role.
+        #[arg(long, default_value = "keys.txt")]
+        keys: String,
+        /// The reader's log, for `--role pair`.
+        #[arg(long, default_value = "reads.txt")]
+        reads: String,
+        #[arg(long, default_value_t = 20)]
+        samples: usize,
+        #[arg(long, value_delimiter = ',', default_values_t = [1024, 16384, 262144])]
+        sizes: Vec<usize>,
+        /// Ask for the contract code on every read probe.
+        #[arg(long, default_value_t = false)]
+        return_code: bool,
+        /// Bound on each probe, and the gap between probes.
+        #[arg(long, default_value_t = 500)]
+        probe_ms: u64,
+        /// Give up on a key after this long.
+        #[arg(long, default_value_t = 120)]
+        limit_secs: u64,
     },
     /// Cold-GET a contract, subscribe, and report what arrives — run on the
     /// FAR node to see whether the near node's updates reach it.
@@ -292,10 +329,19 @@ pub(crate) async fn poll_stat(
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     let wait = Duration::from_secs(cli.timeout_secs);
+    let ws = if cli.local {
+        "ws://127.0.0.1:7609/v1/contract/command?encodingProtocol=native".to_string()
+    } else {
+        cli.ws.clone()
+    };
+    println!(
+        "mode:     {} ({ws})",
+        if cli.local { "LOCAL" } else { "network" }
+    );
     match cli.cmd {
         Cmd::Roundtrip { wasm, n, size } => {
             let code = Arc::new(ContractCode::from(std::fs::read(&wasm)?));
-            let mut client = connect(&cli.ws).await?;
+            let mut client = connect(&ws).await?;
             // A fresh salt per run so every block is new to the network.
             let salt = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)?
@@ -368,7 +414,7 @@ async fn main() -> Result<()> {
         } => {
             // 1. A block this node holds, for the delegate to fetch.
             let code = Arc::new(ContractCode::from(std::fs::read(&block_wasm)?));
-            let mut client = connect(&cli.ws).await?;
+            let mut client = connect(&ws).await?;
             let mut salt = [0u8; 16];
             getrandom::getrandom(&mut salt)?;
             let body = [b"delegate-probe ".as_slice(), &salt].concat();
@@ -383,9 +429,9 @@ async fn main() -> Result<()> {
             let mut msg = b"get".to_vec();
             msg.extend_from_slice(bkey.id().as_bytes());
             let t = Instant::now();
-            let direct = ask(&cli.ws, &dkey, msg, Duration::from_secs(20)).await?;
+            let direct = ask(&ws, &dkey, msg, Duration::from_secs(20)).await?;
             let want = format!("get=ok:{}", state.len());
-            let got = poll_stat(&cli.ws, &dkey, Duration::from_secs(60), |r| {
+            let got = poll_stat(&ws, &dkey, Duration::from_secs(60), |r| {
                 !r.contains("get=pending")
             })
             .await?;
@@ -404,11 +450,11 @@ async fn main() -> Result<()> {
             let _ = client.send(ClientRequest::Disconnect { cause: None }).await;
             let mut msg = b"wake".to_vec();
             msg.extend_from_slice(&wake_secs.to_le_bytes());
-            let (wake_ok, detail) = match ask(&cli.ws, &wkey, msg, Duration::from_secs(10)).await {
+            let (wake_ok, detail) = match ask(&ws, &wkey, msg, Duration::from_secs(10)).await {
                 Err(e) => (false, format!("node refused the delegate: {e}")),
                 Ok(armed) => {
                     let fired = poll_stat(
-                        &cli.ws,
+                        &ws,
                         &wkey,
                         Duration::from_secs(wake_secs as u64 + 30),
                         |r| r.contains("fired=1"),
@@ -451,7 +497,7 @@ async fn main() -> Result<()> {
             return_code,
         } => {
             latency::run(
-                &cli.ws,
+                &ws,
                 &wasm,
                 &delegate_wasm,
                 samples,
@@ -476,7 +522,7 @@ async fn main() -> Result<()> {
             salt,
         } => {
             validate_cost::run(
-                &cli.ws,
+                &ws,
                 &wasm,
                 mode,
                 repeat,
@@ -489,8 +535,36 @@ async fn main() -> Result<()> {
             )
             .await?;
         }
+        Cmd::Xnode {
+            role,
+            wasm,
+            keys,
+            reads,
+            samples,
+            sizes,
+            return_code,
+            probe_ms,
+            limit_secs,
+        } => {
+            xnode::run(
+                &ws,
+                &role,
+                &wasm,
+                samples,
+                &sizes,
+                xnode::ReadOpts {
+                    keys,
+                    reads,
+                    return_code,
+                    probe_ms,
+                    limit_secs,
+                },
+                wait,
+            )
+            .await?;
+        }
         Cmd::Watch { key, secs } => {
-            watch::run(&cli.ws, &key, secs, wait).await?;
+            watch::run(&ws, &key, secs, wait).await?;
         }
     }
     Ok(())
