@@ -340,7 +340,12 @@ pub async fn put_minted(
                     )
                     .await?;
                     trials[i].hedged = true;
-                    hedged_bytes += state.len();
+                    // The whole PUT, not the body: a relay forwards the
+                    // contract container at every hop, so ~120 KiB of wasm
+                    // (F28) rides with every re-put and it is the dominant
+                    // term. Counting only the state reported 180 KiB for a
+                    // trade that actually cost about 5.7 MB.
+                    hedged_bytes += state.len() + code.data().len();
                     progress_pub(format_args!(
                         "  hedged {} at T ({} of {} sent so far)",
                         trials[i].key.id(),
@@ -442,7 +447,8 @@ pub async fn put_minted(
     );
     if let Some(d) = hedge {
         println!(
-            "# hedge: T={:.1}s, fired on {fired} of {eligible} hedge-arm trials, {} KiB re-sent",
+            "# hedge: T={:.1}s, fired on {fired} of {eligible} hedge-arm trials, {} KiB re-sent \
+             (state AND the contract code that rides every PUT — the code is the dominant term)",
             d.as_secs_f64(),
             hedged_bytes / 1024
         );
@@ -585,7 +591,15 @@ pub async fn read(
          round(s) per cycle — a first-readable time is resolved to {cycle_ms} ms, not {probe_ms} ms"
     );
     let mut cursor = 0usize;
+    let mut outstanding = 0usize;
+    let mut reconnects = 0usize;
     while !pending.is_empty() && std::time::Instant::now() < deadline {
+        if outstanding >= OUTSTANDING_CAP {
+            let _ = client.send(ClientRequest::Disconnect { cause: None }).await;
+            client = crate::connect(ws).await?;
+            outstanding = 0;
+            reconnects += 1;
+        }
         let n = BURST.min(pending.len());
         for step in 0..n {
             let (_, id, _, _) = &pending[(cursor + step) % pending.len()];
@@ -606,6 +620,7 @@ pub async fn read(
                 ),
             )
             .await?;
+            outstanding += 1;
         }
         cursor = (cursor + n) % pending.len();
         // Drain for one probe period, crediting every answer that names a
@@ -617,7 +632,10 @@ pub async fn read(
                 Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
                     key: k,
                     ..
-                }))) => seen.push(*k.id()),
+                }))) => {
+                    outstanding = outstanding.saturating_sub(1);
+                    seen.push(*k.id())
+                }
                 Ok(Ok(_)) | Ok(Err(_)) => {}
                 Err(_) => break,
             }
@@ -640,6 +658,10 @@ pub async fn read(
     }
     let _ = client.send(ClientRequest::Disconnect { cause: None }).await;
     println!(
+        "# reconnects: {reconnects} (one per {OUTSTANDING_CAP} unanswered probes — a probe for \
+         a key no node holds is never collected by anything)"
+    );
+    println!(
         "# cold-confirmed={cold_confirmed} void(warm at start)={warm_at_start} \
          read={} missed={}",
         first_reads.len(),
@@ -655,12 +677,28 @@ pub async fn read(
     Ok(())
 }
 
-/// How many probes one round may have outstanding.
+/// How many probes one ROUND sends.
 ///
-/// Not a tuning knob: it is the bound that stops the reader out-sending what
-/// the node answers. A GET for a key nobody holds may never be answered, so
-/// the outstanding count is not self-limiting and something has to limit it.
+/// This bounds a burst. It does NOT bound the leak — see [`OUTSTANDING_CAP`].
 const BURST: usize = 32;
+
+/// How many unanswered probes may accumulate before the connection is
+/// discarded and re-opened.
+///
+/// A GET for a key no node holds is never answered. Not "answered slowly":
+/// never. So every round leaks up to `BURST` requests that nothing will ever
+/// collect, and no PER-ROUND bound can hold the total down — which is why the
+/// per-round bound was not enough. Measured: a run probing 222 cold keys
+/// leaked about 1,900 requests in twelve seconds and the socket backpressured,
+/// killing the second run in a row.
+///
+/// The only way to bound a set nothing removes from is to discard it. A
+/// reconnect costs a websocket handshake and loses nothing that carried
+/// information: an unanswered probe has no answer to lose. What it CAN lose is
+/// an answer in flight at that instant — that key stays pending and is found
+/// one cycle later, which is a resolution cost the run reports, not a
+/// correctness one.
+const OUTSTANDING_CAP: usize = 256;
 
 /// One bounded GET. `Some(len)` when this node served the state.
 /// `bound` is how long to wait for the ANSWER, not for the send.
