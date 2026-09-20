@@ -29,7 +29,7 @@ use std::{
 use anyhow::{bail, Result};
 use craftec_block_contract as block;
 use freenet_stdlib::{
-    client_api::{ClientRequest, ContractRequest, ContractResponse, HostResponse, WebApi},
+    client_api::{ClientRequest, ContractRequest, ContractResponse, HostResponse},
     prelude::*,
 };
 use tokio::time::timeout;
@@ -79,8 +79,8 @@ fn make(code: &Arc<ContractCode<'static>>, size: usize) -> Result<(ContractConta
 /// Put `split` pieces at once and watch both clocks.
 #[allow(clippy::too_many_arguments)]
 async fn trial(
-    writer: &mut WebApi,
-    reader: &mut WebApi,
+    writer: &mut crate::probe::Client,
+    reader: &mut crate::probe::Client,
     code: &Arc<ContractCode<'static>>,
     piece: usize,
     split: usize,
@@ -143,7 +143,7 @@ fn max_of(v: &[f64]) -> f64 {
 
 /// Acknowledgements for THIS trial's keys, offset from the batch start.
 async fn collect_acks(
-    client: &mut WebApi,
+    client: &mut crate::probe::Client,
     ids: &HashSet<ContractInstanceId>,
     deadline: Instant,
     t0: Instant,
@@ -183,7 +183,7 @@ async fn collect_acks(
 /// queueing into what looks like propagation time.
 #[allow(clippy::too_many_arguments)]
 async fn poll_readable(
-    reader: &mut WebApi,
+    reader: &mut crate::probe::Client,
     keys: &[ContractKey],
     want: &HashMap<ContractInstanceId, Vec<u8>>,
     deadline: Instant,

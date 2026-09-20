@@ -24,7 +24,7 @@ use std::{
 use anyhow::{bail, Context, Result};
 use craftec_block_contract as block;
 use freenet_stdlib::{
-    client_api::{ClientRequest, ContractRequest, ContractResponse, HostResponse, WebApi},
+    client_api::{ClientRequest, ContractRequest, ContractResponse, HostResponse},
     prelude::*,
 };
 use tokio::time::timeout;
@@ -152,7 +152,11 @@ impl Drop for TempDir {
     }
 }
 
-async fn put(client: &mut WebApi, contract: ContractContainer, state: &[u8]) -> Result<()> {
+async fn put(
+    client: &mut crate::probe::Client,
+    contract: ContractContainer,
+    state: &[u8],
+) -> Result<()> {
     send_req(
         client,
         ClientRequest::ContractOp(ContractRequest::Put {
@@ -168,7 +172,7 @@ async fn put(client: &mut WebApi, contract: ContractContainer, state: &[u8]) -> 
 }
 
 /// `Some(bytes)` when the node serves exactly these bytes for this key.
-async fn get(client: &mut WebApi, key: &ContractKey, want: &[u8]) -> Result<bool> {
+async fn get(client: &mut crate::probe::Client, key: &ContractKey, want: &[u8]) -> Result<bool> {
     send_req(
         client,
         ClientRequest::ContractOp(ContractRequest::Get {

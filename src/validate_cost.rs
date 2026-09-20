@@ -25,7 +25,7 @@ use std::{sync::Arc, time::Duration};
 
 use anyhow::{anyhow, bail, Result};
 use freenet_stdlib::{
-    client_api::{ClientRequest, ContractRequest, ContractResponse, HostResponse, WebApi},
+    client_api::{ClientRequest, ContractRequest, ContractResponse, HostResponse},
     prelude::*,
 };
 use tokio::time::timeout;
@@ -76,7 +76,7 @@ fn params(mode: u8, repeat: u32, salt: &[u8; 16]) -> Parameters<'static> {
 }
 
 async fn timed_update(
-    client: &mut WebApi,
+    client: &mut crate::probe::Client,
     key: &ContractKey,
     data: UpdateData<'static>,
     wait: Duration,
