@@ -4,6 +4,7 @@
 mod bag;
 mod latency;
 mod pack;
+mod putshape;
 mod register;
 mod set;
 mod stats;
@@ -171,6 +172,30 @@ enum Cmd {
         /// REQUIRED — see `bag --expect-sha`.
         #[arg(long)]
         expect_sha: String,
+    },
+    /// The same payload put as ONE contract or as k in parallel: which shape
+    /// commits sooner, and what each costs in bytes.
+    PutShape {
+        #[arg(long, default_value = "build/accept-all.wasm")]
+        wasm: String,
+        /// Payload bytes per trial, the same for every arm.
+        #[arg(long, default_value_t = 1048576)]
+        total: usize,
+        /// How many pieces to split the payload into. Each must divide `total`.
+        #[arg(long, value_delimiter = ',', default_values_t = [1usize, 2, 4])]
+        splits: Vec<usize>,
+        /// Trials per arm. The arms are interleaved, so round r is taken for
+        /// every arm before round r+1 is taken for any.
+        #[arg(long, default_value_t = 10)]
+        rounds: usize,
+        /// Total seconds for the whole run; 0 turns it off.
+        #[arg(long, default_value_t = 600)]
+        budget_secs: u64,
+        /// How long one read-back GET attempt waits. This sets the resolution
+        /// of the read-back clock: nothing finer than this plus the gap
+        /// between passes can be measured, and the run says so.
+        #[arg(long, default_value_t = 120)]
+        probe_ms: u64,
     },
     /// Set contract live-node round trip. Runs in --local.
     Set {
@@ -631,6 +656,26 @@ async fn main() -> Result<()> {
         }
         Cmd::Pack { wasm, expect_sha } => {
             pack::run(&ws, &wasm, &expect_sha, wait).await?;
+        }
+        Cmd::PutShape {
+            wasm,
+            total,
+            splits,
+            rounds,
+            budget_secs,
+            probe_ms,
+        } => {
+            putshape::run(
+                &ws,
+                &wasm,
+                total,
+                &splits,
+                rounds,
+                budget_secs,
+                probe_ms,
+                wait,
+            )
+            .await?;
         }
         Cmd::Set { wasm, expect_sha } => {
             set::run(&ws, &wasm, &expect_sha, wait).await?;

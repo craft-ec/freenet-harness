@@ -119,6 +119,56 @@ impl std::fmt::Display for Table {
     }
 }
 
+/// The resolution of a polling instrument, and whether a series cleared it.
+///
+/// Every "when did this become readable" number in this harness comes from
+/// asking, waiting one attempt, and asking again. That gives the instrument a
+/// PERIOD, and a series whose whole spread fits inside one period was measured
+/// by the instrument rather than by the node — it says "not on that pass, yes
+/// on the next" and nothing finer. This has now been the cause of two withdrawn
+/// tables, so it is a type rather than a habit: any subcommand that polls
+/// builds one of these, prints it, and asks it about every series before the
+/// numbers are believed.
+#[derive(Clone, Copy, Debug)]
+pub struct Grid {
+    /// One attempt plus the pause before the next, in milliseconds.
+    pub ms: f64,
+}
+
+impl Grid {
+    pub fn new(attempt_ms: f64, gap_ms: f64) -> Self {
+        Grid {
+            ms: attempt_ms + gap_ms,
+        }
+    }
+
+    /// The line that goes above any table this instrument produced.
+    pub fn line(&self) -> String {
+        format!(
+            "resolution: {:.0} ms — this instrument asks, waits one attempt, and asks again, \
+             so nothing finer than that is resolved",
+            self.ms
+        )
+    }
+
+    /// `Some(reason)` when `label`'s numbers are the instrument's own period.
+    ///
+    /// Two conditions, and both are needed. The spread must fit inside one step
+    /// — a series that varies by more than a step is resolving something. And
+    /// the minimum must be ABOVE one step, because a series that came back on
+    /// its first pass was not waiting for the grid at all, and flagging it
+    /// would cry wolf on exactly the fast case.
+    pub fn unresolved(&self, label: &str, s: &Summary) -> Option<String> {
+        (s.max - s.min < self.ms && s.min > self.ms).then(|| {
+            format!(
+                "{label}: every sample landed between {:.0} and {:.0} ms, inside one {:.0} ms step \
+                 — that says \"not on that pass, yes on the next\" and nothing finer",
+                s.min, s.max, self.ms
+            )
+        })
+    }
+}
+
 /// `16384` → `16 KiB`, for table labels.
 pub fn kib(bytes: usize) -> String {
     if bytes >= 1024 && bytes.is_multiple_of(1024) {
@@ -179,6 +229,34 @@ mod tests {
     #[test]
     fn empty_has_no_summary() {
         assert!(Summary::of(&[]).is_none());
+    }
+
+    /// The flag must fire on the case that caused it and stay quiet on the
+    /// case that looks similar and is not. Both halves, because a flag that is
+    /// always on is ignored as fast as one that is never on.
+    #[test]
+    fn the_grid_flags_its_own_period_and_nothing_else() {
+        let g = Grid::new(400.0, 25.0);
+        // The real one: ten trials from 433.8 to 476.3 on a 425 ms grid.
+        let stuck = Summary::of(&[433.8, 435.0, 440.1, 452.0, 476.3]).unwrap();
+        assert!(g.unresolved("1x", &stuck).is_some());
+        // Spread wider than a step: something is being resolved.
+        let spread = Summary::of(&[430.0, 900.0, 1500.0, 2600.0]).unwrap();
+        assert!(g.unresolved("1x", &spread).is_none());
+        // Back on the first pass: never waited for the grid at all.
+        let fast = Summary::of(&[120.0, 145.0, 160.0, 184.0]).unwrap();
+        assert!(g.unresolved("4x", &fast).is_none());
+        // A finer grid resolves a series the coarse one could not. These
+        // samples span three 70 ms steps and sit inside one 425 ms step.
+        let spans = Summary::of(&[433.8, 520.0, 610.0]).unwrap();
+        assert!(
+            g.unresolved("1x", &spans).is_some(),
+            "425 ms cannot resolve this"
+        );
+        assert!(Grid::new(60.0, 10.0).unresolved("1x", &spans).is_none());
+        // And a series that is genuinely inside one step stays flagged however
+        // fine the grid is, because it genuinely is inside one step.
+        assert!(Grid::new(60.0, 10.0).unresolved("1x", &stuck).is_some());
     }
 
     #[test]
