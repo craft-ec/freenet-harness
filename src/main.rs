@@ -3,6 +3,7 @@
 
 mod bag;
 mod latency;
+mod register;
 mod stats;
 mod validate_cost;
 mod wasm_check;
@@ -139,6 +140,13 @@ enum Cmd {
         m: u16,
         /// Refuse to run unless the wasm has this sha256 (prefix accepted).
         /// A parameter, not a constant: these move on every contract change.
+        #[arg(long)]
+        expect_sha: Option<String>,
+    },
+    /// Register contract live-node round trip. Runs in --local.
+    Register {
+        #[arg(long, default_value = "../freenet-contracts/build/register.wasm")]
+        wasm: String,
         #[arg(long)]
         expect_sha: Option<String>,
     },
@@ -585,6 +593,9 @@ async fn main() -> Result<()> {
             expect_sha,
         } => {
             bag::run(&ws, &wasm, work_bits, m, expect_sha.as_deref(), wait).await?;
+        }
+        Cmd::Register { wasm, expect_sha } => {
+            register::run(&ws, &wasm, expect_sha.as_deref(), wait).await?;
         }
         Cmd::Watch { key, secs } => {
             watch::run(&ws, &key, secs, wait).await?;

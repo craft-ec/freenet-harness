@@ -11,6 +11,7 @@ craftec-block-contract = { path = "../freenet-contracts/block", default-features
 # The Bag's own wire code and mining helpers: the harness must not have a
 # second opinion about the format it is testing.
 craftec-bag-contract = { path = "../freenet-contracts/bag", default-features = false, features = ["testing"] }
+craftec-register-contract = { path = "../freenet-contracts/register", default-features = false, features = ["testing"] }
 freenet-stdlib = { version = "0.10.0", features = ["net"] }
 blake3 = "1"
 # For the contract-artifact check. The contracts' own build.sh reports
