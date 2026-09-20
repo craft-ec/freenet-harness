@@ -7,6 +7,7 @@ mod hedge;
 mod kill9;
 mod latency;
 mod pack;
+mod probe;
 mod putshape;
 mod register;
 mod set;
@@ -424,7 +425,7 @@ enum Cmd {
 /// recovery becoming the stall.
 const CONNECT: Duration = Duration::from_secs(15);
 
-pub(crate) async fn connect(ws: &str) -> Result<WebApi> {
+pub(crate) async fn connect(ws: &str) -> Result<probe::Client> {
     let (stream, _) = match timeout(CONNECT, tokio_tungstenite::connect_async(ws)).await {
         Ok(r) => r.map_err(|e| anyhow!("cannot reach the node at {ws}: {e}"))?,
         Err(_) => bail!(
@@ -432,12 +433,16 @@ pub(crate) async fn connect(ws: &str) -> Result<WebApi> {
             CONNECT.as_secs()
         ),
     };
-    Ok(WebApi::start(stream))
+    // The PROBED client, always. There is no ergonomic way to get an
+    // unprobed one: `probe::Client::new_unprobed_for_benchmark` is named so it
+    // cannot pass review unnoticed. Four runs were voided for want of the
+    // number this records.
+    Ok(probe::Client::new(WebApi::start(stream)))
 }
 
 /// Put one fresh Block; returns its contract instance id and state.
 async fn put_block(
-    client: &mut WebApi,
+    client: &mut crate::probe::Client,
     code: &Arc<ContractCode<'static>>,
     body: &[u8],
     wait: Duration,
@@ -470,7 +475,7 @@ async fn put_block(
 
 /// Register a delegate wasm with `params`; returns its key.
 pub(crate) async fn register(
-    client: &mut WebApi,
+    client: &mut crate::probe::Client,
     wasm: &str,
     params: &[u8],
     wait: Duration,

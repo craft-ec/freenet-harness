@@ -556,6 +556,7 @@ dependencies = [
  "freenet-prolly 0.1.0 (git+https://github.com/craft-ec/freenet-prolly?rev=e2756c8)",
  "freenet-stdlib",
  "getrandom 0.2.17",
+ "instrument",
  "sha2",
  "tokio",
  "tokio-tungstenite",
@@ -813,6 +814,11 @@ dependencies = [
  "serde",
  "serde_core",
 ]
+
+[[package]]
+name = "instrument"
+version = "0.1.0"
+source = "git+https://github.com/craft-ec/craftworks-instrument?rev=d765891#d7658911983b6b3800cab6631ea0fa0773b95ef8"
 
 [[package]]
 name = "is_terminal_polyfill"

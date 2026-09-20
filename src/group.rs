@@ -34,7 +34,7 @@ use std::{
 use anyhow::{bail, Result};
 use craftec_block_contract as block;
 use freenet_stdlib::{
-    client_api::{ClientRequest, ContractRequest, ContractResponse, HostResponse, WebApi},
+    client_api::{ClientRequest, ContractRequest, ContractResponse, HostResponse},
     prelude::*,
 };
 use tokio::time::timeout;
@@ -136,13 +136,13 @@ fn mint(code: &Arc<ContractCode<'static>>, size: usize) -> Result<(ContractConta
 /// Read whatever is already waiting, so the next send is not queueing behind
 /// answers nobody collected. A connection nobody drains backpressures, and a
 /// blocked SEND then looks exactly like a dead node.
-async fn drain(client: &mut WebApi) {
+async fn drain(client: &mut crate::probe::Client) {
     while (timeout(Duration::from_millis(1), client.recv()).await).is_ok() {}
 }
 
 /// One bounded GET. `true` when the far node returned exactly these bytes.
 async fn probe(
-    reader: &mut WebApi,
+    reader: &mut crate::probe::Client,
     key: &ContractKey,
     want: &[u8],
     bound: Duration,
@@ -181,8 +181,8 @@ async fn probe(
 
 #[allow(clippy::too_many_arguments)]
 async fn one_group(
-    writer: &mut WebApi,
-    reader: &mut WebApi,
+    writer: &mut crate::probe::Client,
+    reader: &mut crate::probe::Client,
     code: &Arc<ContractCode<'static>>,
     arm: Arm,
     size: usize,

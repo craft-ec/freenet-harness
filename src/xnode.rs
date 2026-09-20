@@ -32,7 +32,7 @@ use std::{sync::Arc, time::Duration};
 use anyhow::{anyhow, bail, Result};
 use craftec_block_contract as block;
 use freenet_stdlib::{
-    client_api::{ClientRequest, ContractRequest, ContractResponse, HostResponse, WebApi},
+    client_api::{ClientRequest, ContractRequest, ContractResponse, HostResponse},
     prelude::*,
 };
 use tokio::time::timeout;
@@ -177,6 +177,10 @@ pub async fn put_minted(
     let text = std::fs::read_to_string(minted)
         .map_err(|e| anyhow!("{minted}: {e} — run the mint role first"))?;
     let mut writer = crate::connect(ws).await?;
+    // The panic path dumps the connection's own stream. Held here rather than
+    // remembered at each `bail!`: a guard that comes with the fixture is the
+    // enforcement that does not rely on anyone wanting it.
+    let _dump = crate::probe::DumpOnPanic::new(&writer, "the put role");
     // A second connection, so a read-back cannot be answered by the put's own
     // reply arriving on the same socket.
     let mut confirm = crate::connect(ws).await?;
@@ -392,8 +396,9 @@ pub async fn put_minted(
         if last_beat.elapsed() >= Duration::from_secs(30) {
             last_beat = std::time::Instant::now();
             progress_pub(format_args!(
-                "  {} sent, {} acked, {} readable here, {} hedged, conditioned {}c/{}h \
+                "  [{}] {} sent, {} acked, {} readable here, {} hedged, conditioned {}c/{}h \
                  of {until_conditioned}",
+                writer.line(),
                 trials.len(),
                 trials.iter().filter(|t| t.ack_ms.is_some()).count(),
                 trials.iter().filter(|t| t.confirm_ms.is_some()).count(),
@@ -833,7 +838,7 @@ const PROBE_ONE: Duration = Duration::from_millis(5);
 /// "send blocked for 0 s" — a duration that reads as nonsense precisely
 /// because it was never meant to be a send budget.
 async fn probe_once(
-    client: &mut WebApi,
+    client: &mut crate::probe::Client,
     id: &ContractInstanceId,
     return_code: bool,
     bound: Duration,

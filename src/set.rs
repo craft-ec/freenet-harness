@@ -13,7 +13,7 @@ use std::{sync::Arc, time::Duration};
 use anyhow::{bail, Result};
 use craftec_set_contract::{testing, wire::SetState};
 use freenet_stdlib::{
-    client_api::{ClientRequest, ContractRequest, ContractResponse, HostResponse, WebApi},
+    client_api::{ClientRequest, ContractRequest, ContractResponse, HostResponse},
     prelude::*,
 };
 use tokio::time::timeout;
@@ -22,7 +22,10 @@ use crate::latency::send_req;
 
 const STEP: Duration = Duration::from_secs(2);
 
-async fn get_state(client: &mut WebApi, key: &ContractKey) -> Result<Option<Vec<u8>>> {
+async fn get_state(
+    client: &mut crate::probe::Client,
+    key: &ContractKey,
+) -> Result<Option<Vec<u8>>> {
     send_req(
         client,
         ClientRequest::ContractOp(ContractRequest::Get {
@@ -52,7 +55,11 @@ async fn get_state(client: &mut WebApi, key: &ContractKey) -> Result<Option<Vec<
     Ok(None)
 }
 
-async fn update(client: &mut WebApi, key: &ContractKey, delta: Vec<u8>) -> Result<Option<Vec<u8>>> {
+async fn update(
+    client: &mut crate::probe::Client,
+    key: &ContractKey,
+    delta: Vec<u8>,
+) -> Result<Option<Vec<u8>>> {
     send_req(
         client,
         ClientRequest::ContractOp(ContractRequest::Update {

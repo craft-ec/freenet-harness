@@ -35,7 +35,7 @@ use craftec_register_contract::{
     wire::{Params as RegParams, RegState},
 };
 use freenet_stdlib::{
-    client_api::{ClientRequest, ContractRequest, ContractResponse, HostResponse, WebApi},
+    client_api::{ClientRequest, ContractRequest, ContractResponse, HostResponse},
     prelude::*,
 };
 use tokio::time::timeout;
@@ -72,7 +72,7 @@ impl Epoch {
 }
 
 /// GET one key and return the state, if the node has it.
-async fn get(client: &mut WebApi, key: &ContractKey) -> Result<Option<Vec<u8>>> {
+async fn get(client: &mut crate::probe::Client, key: &ContractKey) -> Result<Option<Vec<u8>>> {
     send_req(
         client,
         ClientRequest::ContractOp(ContractRequest::Get {
@@ -100,7 +100,12 @@ async fn get(client: &mut WebApi, key: &ContractKey) -> Result<Option<Vec<u8>>> 
 }
 
 /// PUT one state under one epoch's code. `true` when the node kept it.
-async fn put(client: &mut WebApi, epoch: &Epoch, params: &[u8], state: &[u8]) -> Result<bool> {
+async fn put(
+    client: &mut crate::probe::Client,
+    epoch: &Epoch,
+    params: &[u8],
+    state: &[u8],
+) -> Result<bool> {
     let contract = epoch.at(params);
     let key = contract.key();
     send_req(
@@ -346,7 +351,12 @@ pub async fn run(ws: &str, o: Opts) -> Result<()> {
 }
 
 /// The Register half: a signature binds the params, so a record crosses epochs.
-async fn register_half(w: &mut WebApi, reader: &mut WebApi, a: &Epoch, b: &Epoch) -> Result<bool> {
+async fn register_half(
+    w: &mut crate::probe::Client,
+    reader: &mut crate::probe::Client,
+    a: &Epoch,
+    b: &Epoch,
+) -> Result<bool> {
     println!();
     let mut salt = [0u8; 8];
     getrandom::getrandom(&mut salt)?;

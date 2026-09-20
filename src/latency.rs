@@ -17,7 +17,7 @@ use craftec_block_contract as block;
 use craftec_register_contract as register_contract;
 use craftec_set_contract as set_contract;
 use freenet_stdlib::{
-    client_api::{ClientRequest, ContractRequest, ContractResponse, HostResponse, WebApi},
+    client_api::{ClientRequest, ContractRequest, ContractResponse, HostResponse},
     prelude::*,
 };
 use tokio::time::timeout;
@@ -322,7 +322,7 @@ pub(crate) fn ms_since(t: Instant) -> f64 {
 /// one failure an instrument must not have, because it is indistinguishable
 /// from slow.
 pub(crate) async fn send_req(
-    client: &mut WebApi,
+    client: &mut crate::probe::Client,
     req: ClientRequest<'static>,
     wait: Duration,
 ) -> Result<()> {
@@ -342,22 +342,31 @@ pub(crate) async fn send_req(
 /// `what` is the caller's own count of what it has not read. Empty when the
 /// caller genuinely has nothing to add.
 pub(crate) async fn send_req_ctx(
-    client: &mut WebApi,
+    client: &mut crate::probe::Client,
     req: ClientRequest<'static>,
     wait: Duration,
     what: &str,
 ) -> Result<()> {
     match timeout(wait, client.send(req)).await {
-        Ok(r) => r.map_err(Into::into),
-        Err(_) => bail!(
-            "this client's send did not complete within {} s{}{}. A blocked send is \
-             backpressure on a socket this harness is not draining — it is NOT evidence \
-             that the node refused anything. Show the harness was still collecting before \
-             writing that it was.",
-            wait.as_secs(),
-            if what.is_empty() { "" } else { ", " },
-            what
-        ),
+        Ok(r) => r,
+        Err(_) => {
+            // The message is now a PROJECTION of the recording rather than a
+            // sentence someone wrote about it. "What the caller had not
+            // drained" used to be a string each call site passed in by hand,
+            // which is a number that can be wrong; `OUTSTANDING` is counted by
+            // the transport itself, with the ids of the requests that are
+            // stuck, and the tail of the stream comes with it.
+            bail!(
+                "this client's send did not complete within {} s{}{}.\n  {}\n{}\n  \
+                 A blocked send is backpressure on a socket this harness is not draining — \
+                 it is NOT evidence that the node refused anything.",
+                wait.as_secs(),
+                if what.is_empty() { "" } else { ", " },
+                what,
+                client.line(),
+                client.dump("the send that blocked")
+            )
+        }
     }
 }
 
@@ -422,7 +431,7 @@ fn failures(samples: &[Sample]) -> Vec<&str> {
 
 /// Put an already-built container and wait for its acknowledgement.
 pub(crate) async fn put_container(
-    client: &mut WebApi,
+    client: &mut crate::probe::Client,
     contract: ContractContainer,
     state: &[u8],
     wait: Duration,
@@ -483,7 +492,7 @@ impl<K: PartialEq> Awaiting<K> {
 /// 61 s, that lost 5 of 30 samples and every one of them was a slow one, which
 /// biases a percentile in the flattering direction.
 async fn timed_put(
-    client: &mut WebApi,
+    client: &mut crate::probe::Client,
     contract: ContractContainer,
     state: &[u8],
     wait: Duration,
@@ -540,7 +549,7 @@ async fn timed_put(
 /// Get one contract and time the answer. The state is compared, so a get that
 /// returns the wrong bytes is an error and not a fast sample.
 async fn timed_get(
-    client: &mut WebApi,
+    client: &mut crate::probe::Client,
     key: &ContractKey,
     want: &[u8],
     return_code: bool,
@@ -641,7 +650,7 @@ struct SeriesSpec {
 }
 
 async fn measure_series(
-    client: &mut WebApi,
+    client: &mut crate::probe::Client,
     kind: &Kind,
     code: &Arc<ContractCode<'static>>,
     spec: SeriesSpec,
@@ -796,7 +805,7 @@ const PROBE_GRID_MS: f64 = 50.0;
 const PROBE_LIMIT: Duration = Duration::from_secs(30);
 
 async fn poll_readable(
-    client: &mut WebApi,
+    client: &mut crate::probe::Client,
     key: &ContractKey,
     want: &[u8],
     from: Instant,
@@ -851,8 +860,8 @@ async fn poll_readable(
 /// `reader` polls, so a hit can only come from the node serving the block and
 /// never from the put's own response arriving on the same socket.
 struct Pair<'a> {
-    writer: &'a mut WebApi,
-    reader: &'a mut WebApi,
+    writer: &'a mut crate::probe::Client,
+    reader: &'a mut crate::probe::Client,
 }
 
 async fn measure_readable(
@@ -962,7 +971,7 @@ impl ParallelRun {
 }
 
 async fn measure_parallel(
-    client: &mut WebApi,
+    client: &mut crate::probe::Client,
     kind: &Kind,
     code: &Arc<ContractCode<'static>>,
     size: usize,

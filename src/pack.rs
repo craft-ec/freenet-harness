@@ -18,7 +18,7 @@ use anyhow::{anyhow, bail, Result};
 use craftec_block_contract as block;
 use freenet_prolly::node::{NodeBuilder, Value};
 use freenet_stdlib::{
-    client_api::{ClientRequest, ContractRequest, ContractResponse, HostResponse, WebApi},
+    client_api::{ClientRequest, ContractRequest, ContractResponse, HostResponse},
     prelude::*,
 };
 use tokio::time::timeout;
@@ -113,7 +113,7 @@ fn case(name: impl Into<String>, state: Vec<u8>, keep: bool) -> Case {
 /// A block's params ARE the hash of its state, so each case addresses its own
 /// contract and no case can answer for another.
 async fn offer(
-    client: &mut WebApi,
+    client: &mut crate::probe::Client,
     code: &Arc<ContractCode<'static>>,
     state: &[u8],
 ) -> Result<Offer> {

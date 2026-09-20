@@ -25,7 +25,7 @@ use std::{
 use anyhow::{bail, Result};
 use craftec_block_contract as block;
 use freenet_stdlib::{
-    client_api::{ClientRequest, ContractRequest, ContractResponse, HostResponse, WebApi},
+    client_api::{ClientRequest, ContractRequest, ContractResponse, HostResponse},
     prelude::*,
 };
 use tokio::time::timeout;
@@ -89,7 +89,11 @@ fn mint(code: &Arc<ContractCode<'static>>, size: usize) -> Result<(ContractConta
     ))
 }
 
-async fn put(writer: &mut WebApi, contract: ContractContainer, state: &[u8]) -> Result<()> {
+async fn put(
+    writer: &mut crate::probe::Client,
+    contract: ContractContainer,
+    state: &[u8],
+) -> Result<()> {
     send_req(
         writer,
         ClientRequest::ContractOp(ContractRequest::Put {
@@ -107,8 +111,8 @@ async fn put(writer: &mut WebApi, contract: ContractContainer, state: &[u8]) -> 
 /// One trial: put, optionally hedge at `t`, and watch both clocks.
 #[allow(clippy::too_many_arguments)]
 async fn trial(
-    writer: &mut WebApi,
-    reader: &mut WebApi,
+    writer: &mut crate::probe::Client,
+    reader: &mut crate::probe::Client,
     code: &Arc<ContractCode<'static>>,
     size: usize,
     t: Option<Duration>,
