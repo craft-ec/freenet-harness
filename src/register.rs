@@ -8,8 +8,11 @@
 
 use std::{sync::Arc, time::Duration};
 
-use anyhow::{bail, Result};
-use craftec_register_contract::{testing, wire::RegState};
+use anyhow::{anyhow, bail, Result};
+use craftec_register_contract::{
+    testing,
+    wire::{Params, RegState, MAX_LABEL},
+};
 use freenet_stdlib::{
     client_api::{ClientRequest, ContractRequest, ContractResponse, HostResponse, WebApi},
     prelude::*,
@@ -93,7 +96,32 @@ pub async fn run(ws: &str, wasm: &str, expect_sha: &str, wait: Duration) -> Resu
     // previous run's state. (A key is hash(code, params).)
     let mut salt = [0u8; 8];
     getrandom::getrandom(&mut salt)?;
-    let w = testing::keyset_seeded(salt[0], 2, 4, false);
+    let mut w = testing::keyset_seeded(salt[0], 2, 4, false);
+
+    // `keyset_seeded` takes ONE BYTE, so it can mint 256 keysets and the helper
+    // hardcodes the label — which made the key space 256 wide. By the birthday
+    // bound two runs share a key after about 19, and the second run then reads
+    // the first one's final state: measured, 5 of 30 runs opened on seq 9 and
+    // failed steps 1 to 3. The label is a free-form tail of the params
+    // (`MAX_LABEL` = 64) and the key is `hash(code, params)`, so appending this
+    // run's eight random bytes to it makes the space 2^64 without touching the
+    // keys or the contract.
+    //
+    // Re-parsing is the point, not tidiness: every signature binds to
+    // `blake3(params_bytes)`, so `w.params` has to be rebuilt from the salted
+    // bytes BEFORE any record is signed or the whole world disagrees with
+    // itself.
+    let seeded = w.params_bytes.clone();
+    w.params_bytes.extend_from_slice(&salt);
+    if w.params_bytes.len() - seeded.len() > MAX_LABEL {
+        bail!("the salt does not fit in a register label");
+    }
+    w.params = Params::parse(&w.params_bytes)
+        .ok_or_else(|| anyhow!("the salted params must still parse"))?;
+    if w.params_bytes == seeded {
+        bail!("the salt changed nothing — this run can collide with another");
+    }
+    let w = w;
     let p = &w.params;
     let contract = ContractContainer::Wasm(ContractWasmAPIVersion::V1(WrappedContract::new(
         code,
