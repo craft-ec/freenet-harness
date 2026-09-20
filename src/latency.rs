@@ -188,18 +188,67 @@ pub(crate) async fn put_container(
     state: &[u8],
     wait: Duration,
 ) -> Result<()> {
-    match timed_put(client, contract, state, wait).await? {
+    let mut stale = 0usize;
+    match timed_put(client, contract, state, wait, &mut stale).await? {
         Sample::Ms(_) => Ok(()),
         Sample::Failed(e) => bail!("seed put failed: {e}"),
     }
 }
 
+/// Deciding what one arriving response IS, for a series waiting on one key.
+///
+/// Pulled out of the receive loops so it can be tested without a node. The
+/// loops differ only in which response variant they unwrap; the decision they
+/// share is this one, and it is the decision that was wrong.
+///
+/// `Awaiting` is deliberately generic over the key: the bug had nothing to do
+/// with contract ids, and a test that needed a live node to reach it would not
+/// have been written.
+pub(crate) struct Awaiting<K> {
+    want: K,
+    /// Answers to requests this series had already given up on.
+    pub(crate) stale: usize,
+}
+
+impl<K: PartialEq> Awaiting<K> {
+    pub(crate) fn new(want: K) -> Self {
+        Awaiting { want, stale: 0 }
+    }
+
+    /// Offer one arrived response. `None` is a response that carries no key at
+    /// all — another operation's kind, or a message this series does not read.
+    ///
+    /// `true` means it is the awaited answer and the caller should stop. Every
+    /// other case is counted and the caller keeps waiting: an answer to an
+    /// earlier request is that request's business, not this one's, and it must
+    /// neither end this wait nor be recorded as this sample's error.
+    pub(crate) fn offer(&mut self, arrived: Option<&K>) -> bool {
+        match arrived {
+            Some(k) if *k == self.want => true,
+            _ => {
+                self.stale += 1;
+                false
+            }
+        }
+    }
+}
+
 /// Put one contract and time the acknowledgement.
+///
+/// The answer is matched BY KEY, and answers to earlier requests are discarded
+/// rather than counted against this one. One connection carries every request
+/// in a series, so a put that timed out at 90 s and was given up on can still
+/// have its acknowledgement arrive while a LATER put is being timed — and the
+/// earlier version of this function reported that as "unexpected response" and
+/// threw away the later put's sample. On a hotspot, where the first put took
+/// 61 s, that lost 5 of 30 samples and every one of them was a slow one, which
+/// biases a percentile in the flattering direction.
 async fn timed_put(
     client: &mut WebApi,
     contract: ContractContainer,
     state: &[u8],
     wait: Duration,
+    stale: &mut usize,
 ) -> Result<Sample> {
     let key = contract.key();
     let t = Instant::now();
@@ -215,16 +264,38 @@ async fn timed_put(
         wait,
     )
     .await?;
-    Ok(match timeout(wait, client.recv()).await {
-        Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key: k })))
-            if k == key =>
-        {
-            Sample::Ms(ms_since(t))
+    let deadline = t + wait;
+    let mut waiting = Awaiting::new(key);
+    loop {
+        let Some(left) = deadline.checked_duration_since(Instant::now()) else {
+            *stale += waiting.stale;
+            return Ok(Sample::Failed(format!(
+                "no response within {} s",
+                wait.as_secs()
+            )));
+        };
+        let arrived = match timeout(left, client.recv()).await {
+            Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key: k }))) => {
+                Some(k)
+            }
+            Ok(Ok(_other)) => None,
+            Ok(Err(e)) => {
+                *stale += waiting.stale;
+                return Ok(Sample::Failed(format!("node error: {e}")));
+            }
+            Err(_) => {
+                *stale += waiting.stale;
+                return Ok(Sample::Failed(format!(
+                    "no response within {} s",
+                    wait.as_secs()
+                )));
+            }
+        };
+        if waiting.offer(arrived.as_ref()) {
+            *stale += waiting.stale;
+            return Ok(Sample::Ms(ms_since(t)));
         }
-        Ok(Ok(other)) => Sample::Failed(format!("unexpected response: {other:?}")),
-        Ok(Err(e)) => Sample::Failed(format!("node error: {e}")),
-        Err(_) => Sample::Failed(format!("no response within {} s", wait.as_secs())),
-    })
+    }
 }
 
 /// Get one contract and time the answer. The state is compared, so a get that
@@ -235,6 +306,7 @@ async fn timed_get(
     want: &[u8],
     return_code: bool,
     wait: Duration,
+    stale: &mut usize,
 ) -> Result<Sample> {
     let t = Instant::now();
     send_req(
@@ -250,12 +322,42 @@ async fn timed_get(
         wait,
     )
     .await?;
-    Ok(match timeout(wait, client.recv()).await {
-        Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
-            state: got,
-            ..
-        }))) => {
-            if got.as_ref() == want {
+    let deadline = t + wait;
+    // Keyed, not "the next GetResponse". Comparing an answer for another key
+    // against these bytes reports a state mismatch, which reads as a node fault
+    // and is an instrument fault.
+    let mut waiting = Awaiting::new(*key.id());
+    loop {
+        let Some(left) = deadline.checked_duration_since(Instant::now()) else {
+            *stale += waiting.stale;
+            return Ok(Sample::Failed(format!(
+                "no response within {} s",
+                wait.as_secs()
+            )));
+        };
+        let (arrived, got) = match timeout(left, client.recv()).await {
+            Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
+                key: k,
+                state: got,
+                ..
+            }))) => (Some(*k.id()), Some(got)),
+            Ok(Ok(_other)) => (None, None),
+            Ok(Err(e)) => {
+                *stale += waiting.stale;
+                return Ok(Sample::Failed(format!("node error: {e}")));
+            }
+            Err(_) => {
+                *stale += waiting.stale;
+                return Ok(Sample::Failed(format!(
+                    "no response within {} s",
+                    wait.as_secs()
+                )));
+            }
+        };
+        if waiting.offer(arrived.as_ref()) {
+            *stale += waiting.stale;
+            let got = got.expect("a matched GetResponse carries its state");
+            return Ok(if got.as_ref() == want {
                 Sample::Ms(ms_since(t))
             } else {
                 Sample::Failed(format!(
@@ -263,18 +365,23 @@ async fn timed_get(
                     got.as_ref().len(),
                     want.len()
                 ))
-            }
+            });
         }
-        Ok(Ok(other)) => Sample::Failed(format!("unexpected response: {other:?}")),
-        Ok(Err(e)) => Sample::Failed(format!("node error: {e}")),
-        Err(_) => Sample::Failed(format!("no response within {} s", wait.as_secs())),
-    })
+    }
 }
 
 /// Put and warm-get one (kind, size) `n` times.
 struct Series {
     kind: &'static str,
     size: usize,
+    /// How many samples were ASKED for. A series that stopped at its budget
+    /// reports fewer than this, and the gap is the measurement: "we did not
+    /// wait long enough to find out" is a different statement from "30 puts
+    /// took this long", and a table that prints only what came back cannot
+    /// tell them apart.
+    wanted: usize,
+    /// Answers to requests this series had already given up on, discarded.
+    stale: usize,
     put: Vec<Sample>,
     get: Vec<Sample>,
 }
@@ -285,6 +392,8 @@ struct SeriesSpec {
     size: usize,
     n: usize,
     return_code: bool,
+    /// When this series must stop, whatever it has. `None` = no budget.
+    deadline: Option<Instant>,
 }
 
 async fn measure_series(
@@ -299,14 +408,35 @@ async fn measure_series(
         size,
         n,
         return_code,
+        deadline,
     } = spec;
+    let over = || deadline.is_some_and(|d| Instant::now() >= d);
+    // Answers to requests this series had already given up on. Counted, not
+    // silently dropped: they are the measure of how much the run is running
+    // ahead of the node, and a series with many of them is one whose
+    // percentiles were taken while the connection was still catching up.
+    let mut stale_put = 0usize;
+    let mut stale_get = 0usize;
     let mut put = Vec::with_capacity(n);
     let mut held: Vec<(ContractKey, Vec<u8>)> = Vec::with_capacity(n);
     for i in 0..n {
+        // The budget is checked BEFORE a sample is started, never during: a
+        // sample cut off half way is not a fast sample and must not enter the
+        // distribution. What the budget costs is samples not taken, and that
+        // is what the table reports.
+        if over() {
+            progress_pub(format_args!(
+                "  {} {} budget reached after {} of {n} puts",
+                kind.name,
+                kib(size),
+                i
+            ));
+            break;
+        }
         let (contract, state) = (kind.make)(code, size)?;
         let key = contract.key();
         minted.add(*key.id());
-        let s = timed_put(client, contract, &state, wait).await?;
+        let s = timed_put(client, contract, &state, wait, &mut stale_put).await?;
         // Only a block the node acknowledged is a block it can serve warm.
         if matches!(s, Sample::Ms(_)) {
             held.push((key, state));
@@ -329,17 +459,30 @@ async fn measure_series(
     }
     let mut get = Vec::with_capacity(held.len());
     for (key, state) in held.iter() {
-        get.push(timed_get(client, key, state, return_code, wait).await?);
+        if over() {
+            break;
+        }
+        get.push(timed_get(client, key, state, return_code, wait, &mut stale_get).await?);
     }
     progress_pub(format_args!(
-        "  {} {} done ({n} put, {} get)",
+        "  {} {} done ({} of {n} put, {} get)",
         kind.name,
         kib(size),
-        held.len()
+        put.len(),
+        get.len()
     ));
+    if stale_put + stale_get > 0 {
+        progress_pub(format_args!(
+            "  {} {} discarded {stale_put} late put answers and {stale_get} late get answers",
+            kind.name,
+            kib(size)
+        ));
+    }
     Ok(Series {
         kind: kind.name,
         size,
+        wanted: n,
+        stale: stale_put + stale_get,
         put,
         get,
     })
@@ -476,8 +619,9 @@ async fn measure_readable(
         minted.add(*key.id());
         // One clock for both, so the two numbers are comparable.
         let t0 = Instant::now();
+        let mut stale = 0usize;
         let (put, readable) = tokio::join!(
-            timed_put(writer, contract, &state, wait),
+            timed_put(writer, contract, &state, wait, &mut stale),
             poll_readable(reader, &key, &state, t0, wait, Duration::from_millis(50))
         );
         let (put, readable) = (put?, readable?);
@@ -891,6 +1035,7 @@ pub async fn run(
     max_k: usize,
     only: Part,
     return_code: bool,
+    budget_secs: u64,
     wait: Duration,
 ) -> Result<()> {
     if samples == 0 {
@@ -901,6 +1046,20 @@ pub async fn run(
     })?));
     let version = node_version();
     describe_environment(&version);
+
+    // One deadline for the whole run, not one per part. A budget that resets
+    // between parts is not a budget: four parts of "at most ten minutes" is
+    // forty, and the reason to have one at all is that nobody is sitting here
+    // watching. 0 turns it off.
+    let budget = (budget_secs > 0).then(|| Instant::now() + Duration::from_secs(budget_secs));
+    match budget {
+        Some(_) => println!("budget:   {budget_secs} s for the whole run; what is not measured by then is reported as not measured"),
+        None => println!("budget:   none (--budget-secs 0)"),
+    }
+    let spent = || match budget {
+        Some(d) => Instant::now() >= d,
+        None => false,
+    };
 
     let mut client = crate::connect(ws).await?;
     let mut minted = Minted::default();
@@ -918,6 +1077,7 @@ pub async fn run(
                         size,
                         n: samples,
                         return_code,
+                        deadline: budget,
                     },
                     wait,
                     &mut minted,
@@ -933,7 +1093,9 @@ pub async fn run(
     // 3. What does a PutResponse wait for? Put and poll for local readability
     //    off one clock, on two connections.
     let mut readable = Vec::new();
-    if only.wants(Part::Readable) {
+    if only.wants(Part::Readable) && spent() {
+        println!("part readable: SKIPPED — the run reached its budget before it started");
+    } else if only.wants(Part::Readable) {
         let mut reader = crate::connect(ws).await?;
         for kind in KINDS {
             for &size in sizes {
@@ -967,7 +1129,9 @@ pub async fn run(
 
     // 4. Parallel puts on one connection.
     let mut runs = Vec::new();
-    if only.wants(Part::Parallel) {
+    if only.wants(Part::Parallel) && spent() {
+        println!("part parallel: SKIPPED — the run reached its budget before it started");
+    } else if only.wants(Part::Parallel) {
         for &n in parallel {
             let r = measure_parallel(
                 &mut client,
@@ -991,7 +1155,9 @@ pub async fn run(
     // 5. Can a delegate put at all, and how many per process() return?
     let mut dputs = Vec::new();
     let mut delegate_note = String::new();
-    if only.wants(Part::DelegatePut) {
+    if only.wants(Part::DelegatePut) && spent() {
+        println!("part delegate-put: SKIPPED — the run reached its budget before it started");
+    } else if only.wants(Part::DelegatePut) {
         let block_code = std::fs::read(wasm)?;
         let mut salt = [0u8; 16];
         getrandom::getrandom(&mut salt)?;
@@ -1050,7 +1216,7 @@ pub async fn run(
 
 fn print_series(series: &[Series], pick: fn(&Series) -> &Vec<Sample>) {
     let mut t = Table::new(
-        ["kind", "size", "n", "errors", ">=240s", ">10xp50"]
+        ["kind", "size", "asked", "n", "errors", ">=240s", ">10xp50"]
             .into_iter()
             .chain(Summary::HEADINGS),
     );
@@ -1059,9 +1225,29 @@ fn print_series(series: &[Series], pick: fn(&Series) -> &Vec<Sample>) {
         let samples = pick(s);
         let lat = latencies(samples);
         let errs = failures(samples);
+        if s.stale > 0 {
+            notes.push(format!(
+                "{} {}: {} late answer(s) to requests already given up on were discarded, \
+                 not charged to a later sample",
+                s.kind,
+                kib(s.size),
+                s.stale
+            ));
+        }
+        if samples.len() < s.wanted {
+            notes.push(format!(
+                "{} {}: {} of {} samples taken — the run reached its budget, \
+                 the rest are NOT within it",
+                s.kind,
+                kib(s.size),
+                samples.len(),
+                s.wanted
+            ));
+        }
         let head = vec![
             s.kind.to_string(),
             kib(s.size),
+            s.wanted.to_string(),
             lat.len().to_string(),
             errs.len().to_string(),
             stalls(samples).to_string(),
@@ -1284,5 +1470,87 @@ mod tests {
         let deltas: Vec<f64> = rows.iter().filter_map(|r| r.delta_ms()).collect();
         assert_eq!(deltas, [800.0, -800.0]);
         assert_eq!(deltas.iter().filter(|d| **d < 0.0).count(), 1);
+    }
+
+    /// What actually happens on one connection carrying a whole series.
+    ///
+    /// Put 1 times out at its deadline and the series gives up on it. Put 2 is
+    /// issued, and WHILE it is being timed, put 1's acknowledgement finally
+    /// arrives. The question the instrument has to answer is what that is —
+    /// and answering it wrong cost 5 of 30 hotspot samples, every one of them a
+    /// slow sample, which biases a percentile in the flattering direction.
+    fn script() -> Vec<Option<u8>> {
+        vec![
+            Some(1),  // put 1's ack, arriving after put 1 was abandoned
+            None,     // something that is not a PutResponse at all
+            Some(99), // an answer for a key this series has never heard of
+            Some(2),  // and finally put 2's own answer
+        ]
+    }
+
+    #[test]
+    fn a_late_answer_for_an_earlier_key_is_discarded_and_counted_and_the_later_put_keeps_its_sample(
+    ) {
+        let mut w = Awaiting::new(2u8);
+        let mut matched = None;
+        for (i, ev) in script().iter().enumerate() {
+            if w.offer(ev.as_ref()) {
+                matched = Some(i);
+                break;
+            }
+        }
+        assert_eq!(matched, Some(3), "put 2 must still get its own sample");
+        assert_eq!(w.stale, 3, "the three that were not put 2's are counted");
+    }
+
+    /// An answer for a key nobody is waiting for is a fact about the
+    /// connection, not a failure of this sample. It is counted so a run can
+    /// say how far ahead of the node it is running.
+    #[test]
+    fn an_unknown_key_is_counted_and_is_not_fatal() {
+        let mut w = Awaiting::new(2u8);
+        assert!(!w.offer(Some(&99)));
+        assert!(!w.offer(None));
+        assert_eq!(w.stale, 2);
+        assert!(
+            w.offer(Some(&2)),
+            "and the wait continues to its own answer"
+        );
+    }
+
+    /// THE CONTROL. The logic this replaced — the next response wins, anything
+    /// else is an error — run against the same script. It must get it wrong, or
+    /// the tests above are not evidence that anything was fixed.
+    #[test]
+    fn the_old_next_response_wins_logic_fails_this_script() {
+        #[derive(Debug, PartialEq)]
+        enum Old {
+            Sample,
+            Failed,
+        }
+        fn next_response_wins(want: u8, events: &[Option<u8>]) -> Old {
+            match events.first() {
+                Some(Some(k)) if *k == want => Old::Sample,
+                _ => Old::Failed, // "unexpected response"
+            }
+        }
+        assert_eq!(
+            next_response_wins(2, &script()),
+            Old::Failed,
+            "the old logic loses put 2's sample to put 1's late ack"
+        );
+        // And the new one does not.
+        let mut w = Awaiting::new(2u8);
+        assert!(script().iter().any(|e| w.offer(e.as_ref())));
+    }
+
+    /// The count is what makes the loss visible in a table. A matcher that
+    /// silently skipped would behave correctly and report nothing.
+    #[test]
+    fn nothing_is_discarded_silently() {
+        let mut w = Awaiting::new(7u8);
+        assert_eq!(w.stale, 0);
+        assert!(w.offer(Some(&7)));
+        assert_eq!(w.stale, 0, "a clean match discards nothing");
     }
 }
