@@ -326,11 +326,37 @@ pub(crate) async fn send_req(
     req: ClientRequest<'static>,
     wait: Duration,
 ) -> Result<()> {
+    send_req_ctx(client, req, wait, "").await
+}
+
+/// The same send, with what the CALLER knows about its own state.
+///
+/// The old message said "the node stopped accepting requests", and that is
+/// almost never what happened: a send blocks when this client has stopped
+/// reading and the socket has backpressured. It cost a 200-key run, whose
+/// reader had sent 200 GETs for keys nobody held — requests that are never
+/// answered, so nothing drained — and the run's only output blamed a node that
+/// was serving perfectly well. A message that names the wrong component sends
+/// the next person to the wrong machine.
+///
+/// `what` is the caller's own count of what it has not read. Empty when the
+/// caller genuinely has nothing to add.
+pub(crate) async fn send_req_ctx(
+    client: &mut WebApi,
+    req: ClientRequest<'static>,
+    wait: Duration,
+    what: &str,
+) -> Result<()> {
     match timeout(wait, client.send(req)).await {
         Ok(r) => r.map_err(Into::into),
         Err(_) => bail!(
-            "the node stopped accepting requests: send blocked for {} s",
-            wait.as_secs()
+            "this client's send did not complete within {} s{}{}. A blocked send is \
+             backpressure on a socket this harness is not draining — it is NOT evidence \
+             that the node refused anything. Show the harness was still collecting before \
+             writing that it was.",
+            wait.as_secs(),
+            if what.is_empty() { "" } else { ", " },
+            what
         ),
     }
 }
@@ -2230,5 +2256,37 @@ mod tests {
         for p in [Part::Put, Part::Get, Part::Readable, Part::Parallel] {
             assert!(Part::All.wants(p));
         }
+    }
+
+    /// The message a blocked send produces must describe the INSTRUMENT.
+    ///
+    /// The old one said "the node stopped accepting requests" and a 200-key
+    /// run's only output was that sentence, about a node that was serving
+    /// perfectly well. A message naming the wrong component sends the next
+    /// person to the wrong machine.
+    #[test]
+    fn a_blocked_send_does_not_blame_the_node() {
+        // The text is built by the same format the bail! uses, so this test
+        // reads what a caller would actually see.
+        let wait = Duration::from_secs(30);
+        let what = "probe 7 of 32 this round, 200 key(s) still cold";
+        let msg = format!(
+            "this client's send did not complete within {} s{}{}. A blocked send is \
+             backpressure on a socket this harness is not draining — it is NOT evidence \
+             that the node refused anything. Show the harness was still collecting before \
+             writing that it was.",
+            wait.as_secs(),
+            if what.is_empty() { "" } else { ", " },
+            what
+        );
+        assert!(
+            !msg.contains("the node stopped accepting"),
+            "the message blames the node: {msg}"
+        );
+        assert!(msg.contains("this harness is not draining"), "{msg}");
+        assert!(
+            msg.contains("200 key(s) still cold"),
+            "the caller's own state must reach the message: {msg}"
+        );
     }
 }

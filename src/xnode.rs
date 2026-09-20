@@ -38,8 +38,8 @@ use freenet_stdlib::{
 use tokio::time::timeout;
 
 use crate::{
-    latency::{ms_since, send_req},
-    stats::{kib, Summary, Table},
+    latency::{ms_since, progress_pub, send_req},
+    stats::{kib, Grid, Summary, Table},
 };
 
 fn now_ns() -> u128 {
@@ -95,13 +95,29 @@ fn mint(code: &Arc<ContractCode<'static>>, size: usize) -> Result<(ContractConta
 /// must travel over the same link the block is propagating on, and the block
 /// wins. Minting first lets the reader prove the key is cold and be already
 /// polling when the write happens.
-pub async fn mint_only(wasm: &str, samples: usize, sizes: &[usize], out: &str) -> Result<()> {
+pub async fn mint_only(
+    wasm: &str,
+    samples: usize,
+    sizes: &[usize],
+    out: &str,
+    arms: bool,
+) -> Result<()> {
     let code = Arc::new(ContractCode::from(std::fs::read(wasm).map_err(|e| {
         anyhow!("{wasm}: {e} — run ../freenet-contracts/build.sh first")
     })?));
     let mut f = String::new();
+    let mut n = 0usize;
     for &size in sizes {
         for _ in 0..samples {
+            // Interleaved, not blocked: two arms run one after the other are
+            // two runs under two sets of conditions, and on a hotspot the
+            // conditions are the thing that moves.
+            let arm = if arms && n % 2 == 1 {
+                Arm::Hedge
+            } else {
+                Arm::Control
+            };
+            n += 1;
             let mut seed = [0u8; 16];
             getrandom::getrandom(&mut seed)?;
             let body = body_from_seed(&seed, size);
@@ -112,19 +128,26 @@ pub async fn mint_only(wasm: &str, samples: usize, sizes: &[usize], out: &str) -
                 params,
             )))
             .key();
-            // key, body size, seed — the put phase regenerates identical bytes.
+            // key, body size, seed, arm — the put phase regenerates identical
+            // bytes and inherits the assignment rather than making one.
             f.push_str(&format!(
-                "MINT {} {} {}\n",
+                "MINT {} {} {} {}\n",
                 key.id(),
                 size,
-                seed.iter().map(|b| format!("{b:02x}")).collect::<String>()
+                seed.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+                arm.as_str()
             ));
         }
     }
     std::fs::write(out, f)?;
     println!(
-        "# minted {} blocks to {out} (nothing put yet)",
-        samples * sizes.len()
+        "# minted {} blocks to {out} (nothing put yet){}",
+        samples * sizes.len(),
+        if arms {
+            ", interleaved control/hedge"
+        } else {
+            ", all control"
+        }
     );
     Ok(())
 }
@@ -142,7 +165,14 @@ pub async fn mint_only(wasm: &str, samples: usize, sizes: &[usize], out: &str) -
 /// The ack is still collected, on its own connection-draining pass with its
 /// own deadline, and reported as its own column. Not measuring it would trade
 /// one blind spot for another.
-pub async fn put_minted(ws: &str, wasm: &str, minted: &str, wait: Duration) -> Result<()> {
+pub async fn put_minted(
+    ws: &str,
+    wasm: &str,
+    minted: &str,
+    hedge: Option<Duration>,
+    until_conditioned: usize,
+    wait: Duration,
+) -> Result<()> {
     let code = Arc::new(ContractCode::from(std::fs::read(wasm)?));
     let text = std::fs::read_to_string(minted)
         .map_err(|e| anyhow!("{minted}: {e} — run the mint role first"))?;
@@ -150,12 +180,33 @@ pub async fn put_minted(ws: &str, wasm: &str, minted: &str, wait: Duration) -> R
     // A second connection, so a read-back cannot be answered by the put's own
     // reply arriving on the same socket.
     let mut confirm = crate::connect(ws).await?;
-    let mut sent: Vec<(ContractInstanceId, String, usize, u128)> = Vec::new();
 
-    // Phase 1: issue EVERY put before confirming any. A batch then pays the
-    // relay tail once rather than N times — sequential put-and-wait is what
-    // made a 21-block run take three minutes.
-    let mut pending: Vec<(ContractKey, usize, u128, std::time::Instant)> = Vec::new();
+    /// One trial's whole life, so the loop below has one place to look.
+    struct T {
+        key: ContractKey,
+        size: usize,
+        seed: [u8; 16],
+        arm: Arm,
+        sent_ns: u128,
+        t0: std::time::Instant,
+        ack_ms: Option<f64>,
+        confirm_ms: Option<f64>,
+        unacked_at_t: Option<bool>,
+        hedged: bool,
+        marked: bool,
+    }
+
+    // The plan: what to send, in order. Nothing is sent here.
+    //
+    // Sending every put BEFORE the loop starts — which is what this role used
+    // to do — makes the hedge unusable at scale. A hedge fires T after its own
+    // trial's send, and the loop that fires it cannot run until the last send
+    // returns: on a hotspot uplink, 200 puts of ~127 KiB each take minutes, so
+    // trial 1's hedge would fire minutes after its T rather than at it, and
+    // the "T" in the table would be a number nothing obeyed. The sends are now
+    // issued BY the loop, one per pass, so each trial's clock starts when its
+    // own bytes go out and the hedges keep their timing.
+    let mut plan: Vec<([u8; 16], usize, Arm)> = Vec::new();
     for line in text.lines() {
         let f: Vec<&str> = line.split_whitespace().collect();
         if f.first() != Some(&"MINT") || f.len() < 4 {
@@ -166,90 +217,341 @@ pub async fn put_minted(ws: &str, wasm: &str, minted: &str, wait: Duration) -> R
         for (i, b) in seed.iter_mut().enumerate() {
             *b = u8::from_str_radix(&f[3][i * 2..i * 2 + 2], 16).unwrap_or(0);
         }
-        let state = block::encode(block::kind::RAW, &body_from_seed(&seed, size));
-        let params = Parameters::from(blake3::hash(&state).as_bytes().to_vec());
-        let contract = ContractContainer::Wasm(ContractWasmAPIVersion::V1(WrappedContract::new(
-            code.clone(),
-            params,
-        )));
-        let key = contract.key();
-        let t_send = now_ns();
-        let t = std::time::Instant::now();
-        send_req(
-            &mut writer,
-            ClientRequest::ContractOp(ContractRequest::Put {
-                contract,
-                state: WrappedState::from(state.clone()),
-                related_contracts: RelatedContracts::default(),
-                subscribe: false,
-                blocking_subscribe: false,
-            }),
-            Duration::from_secs(30),
-        )
-        .await?;
-
-        pending.push((key, size, t_send, t));
-        sent.push((*key.id(), key.id().to_string(), size, t_send));
+        plan.push((
+            seed,
+            size,
+            f.get(4).map(|a| Arm::parse(a)).unwrap_or(Arm::Control),
+        ));
     }
+    let expected = plan.len();
+    let mut trials: Vec<T> = Vec::with_capacity(expected);
+    let mut to_send = 0usize;
+    let mut last_beat = std::time::Instant::now();
+    let mut stopped_at_milestone = false;
+    // How long to wait for straggler acknowledgements once nothing else can
+    // change. The relay's flat wait is 60 s (F20), so this is one of those and
+    // not a budget for the run.
+    const SETTLE: Duration = Duration::from_secs(75);
+    let spent_waiting = std::time::Instant::now();
 
-    // Phase 2: confirm each by bounded read-back on the OTHER connection, so a
-    // read-back can never be answered by the put's own reply.
-    let mut confirmed_n = 0usize;
-    for (key, size, t_send, t) in &pending {
-        let mut confirmed: Option<f64> = None;
-        let gate = std::time::Instant::now() + Duration::from_secs(2);
-        while std::time::Instant::now() < gate {
-            if probe_once(&mut confirm, key.id(), false, Duration::from_millis(200))
+    // Phase 2: ONE loop for the three things that are all happening at once —
+    // acknowledgements arriving, the hedge's instant coming round, and the
+    // local read-back. Two loops would mean a hedge that cannot fire while a
+    // read-back is waiting, which is a hedge timed by whatever else the loop
+    // was doing rather than by T.
+    // The caller's `--timeout-secs` IS the budget for this role, not a floor
+    // under a hidden cap: with the sends inside the loop, a 180 s ceiling
+    // would stop a 200-trial run a third of the way through and report the
+    // rest as unsent. Every run states its budget on the command line.
+    let budget = std::time::Instant::now() + wait;
+    let mut hedged_bytes = 0usize;
+    let mut next = 0usize;
+    while std::time::Instant::now() < budget {
+        // One send per pass, so a trial's clock starts when its own bytes go
+        // out and every hedge below is timed from that instant.
+        if to_send < plan.len() {
+            let (seed, size, arm) = plan[to_send];
+            to_send += 1;
+            let state = block::encode(block::kind::RAW, &body_from_seed(&seed, size));
+            let params = Parameters::from(blake3::hash(&state).as_bytes().to_vec());
+            let contract = ContractContainer::Wasm(ContractWasmAPIVersion::V1(
+                WrappedContract::new(code.clone(), params),
+            ));
+            let key = contract.key();
+            let sent_ns = now_ns();
+            let t0 = std::time::Instant::now();
+            send_req(
+                &mut writer,
+                ClientRequest::ContractOp(ContractRequest::Put {
+                    contract,
+                    state: WrappedState::from(state.clone()),
+                    related_contracts: RelatedContracts::default(),
+                    subscribe: false,
+                    blocking_subscribe: false,
+                }),
+                Duration::from_secs(60),
+            )
+            .await?;
+            progress_pub(format_args!(
+                "  sent {}/{} {} {}",
+                trials.len() + 1,
+                plan.len(),
+                arm.as_str(),
+                key.id()
+            ));
+            trials.push(T {
+                key,
+                size,
+                seed,
+                arm,
+                sent_ns,
+                t0,
+                ack_ms: None,
+                confirm_ms: None,
+                unacked_at_t: None,
+                hedged: false,
+                marked: hedge.is_none(),
+            });
+        }
+
+        // Acknowledgements first: they are what the hedge decision reads, and
+        // an ack sitting unread in the socket is a hedge fired for nothing.
+        while let Ok(Ok(msg)) = timeout(Duration::from_millis(0), writer.recv()).await {
+            if let HostResponse::ContractResponse(ContractResponse::PutResponse { key: k }) = msg {
+                if let Some(t) = trials.iter_mut().find(|t| t.key.id() == k.id()) {
+                    if t.ack_ms.is_none() {
+                        t.ack_ms = Some(ms_since(t.t0));
+                    }
+                }
+            }
+        }
+
+        // The mark is taken in BOTH arms at each trial's own T, so "still
+        // unacknowledged at T" means the same thing on each side of the
+        // comparison. Only the hedge arm acts on it.
+        if let Some(d) = hedge {
+            let now = std::time::Instant::now();
+            // By index, and `trials` is borrowed mutably inside: the body
+            // both reads a trial's state and awaits a send, which an iterator
+            // over `&mut` cannot do while the loop also reads `code`.
+            #[allow(clippy::needless_range_loop)]
+            for i in 0..trials.len() {
+                if trials[i].marked || now < trials[i].t0 + d {
+                    continue;
+                }
+                trials[i].marked = true;
+                let still = trials[i].ack_ms.is_none();
+                trials[i].unacked_at_t = Some(still);
+                if still && trials[i].arm == Arm::Hedge {
+                    // The SAME bytes under the SAME key: re-putting an
+                    // immutable block is idempotent, so this is a second offer
+                    // of one block and not a new block.
+                    let state = block::encode(
+                        block::kind::RAW,
+                        &body_from_seed(&trials[i].seed, trials[i].size),
+                    );
+                    let params = Parameters::from(blake3::hash(&state).as_bytes().to_vec());
+                    let same = ContractContainer::Wasm(ContractWasmAPIVersion::V1(
+                        WrappedContract::new(code.clone(), params),
+                    ));
+                    send_req(
+                        &mut writer,
+                        ClientRequest::ContractOp(ContractRequest::Put {
+                            contract: same,
+                            state: WrappedState::from(state.clone()),
+                            related_contracts: RelatedContracts::default(),
+                            subscribe: false,
+                            blocking_subscribe: false,
+                        }),
+                        Duration::from_secs(60),
+                    )
+                    .await?;
+                    trials[i].hedged = true;
+                    // The whole PUT, not the body: a relay forwards the
+                    // contract container at every hop, so ~120 KiB of wasm
+                    // (F28) rides with every re-put and it is the dominant
+                    // term. Counting only the state reported 180 KiB for a
+                    // trade that actually cost about 5.7 MB.
+                    hedged_bytes += state.len() + code.data().len();
+                    progress_pub(format_args!(
+                        "  hedged {} at T ({} of {} sent so far)",
+                        trials[i].key.id(),
+                        i + 1,
+                        plan.len()
+                    ));
+                }
+            }
+        }
+
+        // One read-back attempt per pass, round-robin over the trials that do
+        // not have one yet, so no single slow key stalls the others' hedges.
+        let mut looked = 0usize;
+        while looked < trials.len() && !trials.is_empty() {
+            let i = next % trials.len();
+            next += 1;
+            looked += 1;
+            if trials[i].confirm_ms.is_none() {
+                if probe_once(
+                    &mut confirm,
+                    trials[i].key.id(),
+                    false,
+                    Duration::from_millis(200),
+                )
                 .await?
                 .is_some()
-            {
-                confirmed = Some(ms_since(*t));
+                {
+                    trials[i].confirm_ms = Some(ms_since(trials[i].t0));
+                }
                 break;
             }
         }
-        match confirmed {
-            Some(ms) => {
-                confirmed_n += 1;
-                println!("PUT {} {} {:.1} {}", key.id(), t_send, ms, size)
+
+        // A heartbeat, because a run that prints nothing until phase 3 is
+        // indistinguishable from a wedged one — `grep -c '^PUT'` returned 0
+        // seventy seconds into a 25-minute run, and that told nobody anything.
+        if last_beat.elapsed() >= Duration::from_secs(30) {
+            last_beat = std::time::Instant::now();
+            progress_pub(format_args!(
+                "  {} sent, {} acked, {} readable here, {} hedged, conditioned {}c/{}h \
+                 of {until_conditioned}",
+                trials.len(),
+                trials.iter().filter(|t| t.ack_ms.is_some()).count(),
+                trials.iter().filter(|t| t.confirm_ms.is_some()).count(),
+                trials.iter().filter(|t| t.hedged).count(),
+                trials
+                    .iter()
+                    .filter(|t| t.arm == Arm::Control && t.unacked_at_t == Some(true))
+                    .count(),
+                trials
+                    .iter()
+                    .filter(|t| t.arm == Arm::Hedge && t.unacked_at_t == Some(true))
+                    .count()
+            ));
+        }
+
+        // The MILESTONE, not the clock.
+        //
+        // What this run needs is a conditioned population — trials still
+        // unacknowledged at T, in BOTH arms — because that is the only
+        // comparison worth printing. So it stops when it HAS that, and `wait`
+        // is a backstop set far beyond rather than the thing being waited on.
+        // A duration ends a healthy run early and lets a barren one burn the
+        // whole budget.
+        let conditioned = |arm: Arm| {
+            trials
+                .iter()
+                .filter(|t| t.arm == arm && t.unacked_at_t == Some(true))
+                .count()
+        };
+        if until_conditioned > 0
+            && conditioned(Arm::Control) >= until_conditioned
+            && conditioned(Arm::Hedge) >= until_conditioned
+        {
+            progress_pub(format_args!(
+                "  milestone: {until_conditioned} conditioned in each arm ({} control, {} \
+                 hedge) after {} of {} trials — stopping, the comparison has what it needs",
+                conditioned(Arm::Control),
+                conditioned(Arm::Hedge),
+                trials.len(),
+                plan.len()
+            ));
+            stopped_at_milestone = true;
+            break;
+        }
+
+        // Everything that CAN still happen has happened.
+        //
+        // Every trial sent, and every trial's T has passed — so the conditioned
+        // population can no longer grow, whether or not it reached the
+        // milestone. Waiting on beyond that is waiting for a straggler
+        // acknowledgement, which is the relay tail (F20) and is not what this
+        // run measures. A run whose milestone became UNREACHABLE used to spin
+        // to its backstop: 200 sent, 24 of 25 conditioned in one arm, nothing
+        // left to send, 35 minutes of nothing.
+        let all_sent = to_send == plan.len();
+        let all_marked = trials.iter().all(|t| t.marked);
+        let all_settled = trials
+            .iter()
+            .all(|t| t.confirm_ms.is_some() && t.ack_ms.is_some());
+        if all_sent && all_marked && (all_settled || spent_waiting.elapsed() >= SETTLE) {
+            if until_conditioned > 0 && !stopped_at_milestone {
+                progress_pub(format_args!(
+                    "  milestone UNREACHABLE: {} control, {} hedge conditioned of the {} asked \
+                     for, and all {} trials are sent — nothing further can raise it",
+                    conditioned(Arm::Control),
+                    conditioned(Arm::Hedge),
+                    until_conditioned,
+                    trials.len()
+                ));
             }
-            None => println!("# not readable within 2 s after send: {}", key.id()),
+            break;
+        }
+        if !all_settled && all_sent && all_marked {
+            // Count down out loud rather than sit silent on the last ack.
+            if last_beat.elapsed() >= Duration::from_secs(5) {
+                progress_pub(format_args!(
+                    "  waiting on {} straggler ack(s) for up to {} more s",
+                    trials.iter().filter(|t| t.ack_ms.is_none()).count(),
+                    SETTLE.saturating_sub(spent_waiting.elapsed()).as_secs()
+                ));
+            }
         }
     }
 
-    // Now collect whatever acks arrived, bounded — never blocking a put on one.
-    let mut acked = 0usize;
-    let ack_deadline = std::time::Instant::now() + wait.min(Duration::from_secs(90));
-    while acked < sent.len() && std::time::Instant::now() < ack_deadline {
-        let Some(left) = ack_deadline.checked_duration_since(std::time::Instant::now()) else {
-            break;
-        };
-        match timeout(left, writer.recv()).await {
-            Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { .. }))) => {
-                acked += 1
-            }
-            Ok(Ok(_)) | Ok(Err(_)) => {}
-            Err(_) => break,
+    // Phase 3: one line per trial, with everything the pairing needs.
+    let mut confirmed_n = 0usize;
+    for t in &trials {
+        // A line for EVERY trial that was sent, whether or not the WRITER
+        // could read it back. The measurement this run exists for is the far
+        // node's, and it does not need the writer's confirmation — dropping
+        // the unconfirmed ones threw away 58 of 122 trials, including most of
+        // the conditioned population the run had just been stopped for.
+        if t.confirm_ms.is_some() {
+            confirmed_n += 1;
+        }
+        {
+            let ms = t.confirm_ms;
+            println!(
+                "PUT {} {} {} {} {} {} {} {}",
+                t.key.id(),
+                t.sent_ns,
+                // "-" rather than a number: the writer never served it
+                // within the run. That is a fact about the writer, and it
+                // must not be confused with 0 ms.
+                ms.map(|v| format!("{v:.1}")).unwrap_or("-".into()),
+                t.size,
+                t.arm.as_str(),
+                match t.unacked_at_t {
+                    Some(true) => "unacked",
+                    Some(false) => "acked",
+                    None => "-",
+                },
+                if t.hedged { "hedged" } else { "-" },
+                t.ack_ms.map(|a| format!("{a:.1}")).unwrap_or("-".into()),
+            );
         }
     }
-    // The run asserts its own stimulus rather than leaving a later reader to
-    // notice. `expected` is the number of MINT lines; if fewer were sent, no
-    // result derived from this run means anything.
-    let expected = text.lines().filter(|l| l.starts_with("MINT ")).count();
-    if let Err(e) = stimulus_ok(expected, pending.len(), confirmed_n) {
+
+    // The stimulus assertion asks "did the run send what it set out to send".
+    // With a milestone, what it set out to do was REACH THE MILESTONE, and
+    // stopping short of the plan is the feature — so the expectation is what
+    // was sent. Left as the plan, this assertion killed a run that had just
+    // reported hitting its milestone.
+    let intended = if stopped_at_milestone {
+        trials.len()
+    } else {
+        expected
+    };
+    if let Err(e) = stimulus_ok(intended, trials.len(), confirmed_n) {
         bail!("{e}");
     }
+    if stopped_at_milestone {
+        println!(
+            "# stopped at the milestone: {} of {} planned trials sent, which is the point — \
+             the run collected the conditioned population it needed and stopped.",
+            trials.len(),
+            expected
+        );
+    }
 
-    // Count SENDS and CONFIRMATIONS separately. They are different facts, and
-    // conflating them understated a stimulus once already: puts are issued in
-    // phase 1, so a failure during phase-2 confirmation leaves every block
-    // genuinely published while the line count suggests almost none were.
+    let acked = trials.iter().filter(|t| t.ack_ms.is_some()).count();
+    let fired = trials.iter().filter(|t| t.hedged).count();
+    let eligible = trials.iter().filter(|t| t.arm == Arm::Hedge).count();
     println!(
         "# stimulus: {} sent, {} read-back confirmed, {} acks collected (the rest are the \
          relay tail, not failures)",
-        pending.len(),
+        trials.len(),
         confirmed_n,
         acked
     );
+    if let Some(d) = hedge {
+        println!(
+            "# hedge: T={:.1}s, fired on {fired} of {eligible} hedge-arm trials, {} KiB re-sent \
+             (state AND the contract code that rides every PUT — the code is the dominant term)",
+            d.as_secs_f64(),
+            hedged_bytes / 1024
+        );
+    }
     let _ = writer.send(ClientRequest::Disconnect { cause: None }).await;
     let _ = confirm
         .send(ClientRequest::Disconnect { cause: None })
@@ -328,7 +630,20 @@ pub async fn read(
     // every key is re-probed on the same cadence.
     let mut pending: Vec<(String, ContractInstanceId, u128, String)> = Vec::new();
     let mut warm_at_start = 0usize;
+    // The control pass had no deadline at all: 240 bounded probes is a minute
+    // on a good day and unbounded on a bad one, before the run's own limit had
+    // been consulted once.
+    let started = std::time::Instant::now();
+    let deadline = started + Duration::from_secs(limit_secs);
     for line in text.lines() {
+        if std::time::Instant::now() >= deadline {
+            bail!(
+                "the {limit_secs} s limit ran out during the COLD CONTROL, with {} of the keys \
+                 checked. No key was proved cold, so nothing this run could measure would mean \
+                 anything.",
+                pending.len() + warm_at_start
+            );
+        }
         let f: Vec<&str> = line.split_whitespace().collect();
         // Accept both shapes: PUT lines carry the send time, MINT lines do
         // not exist yet on the network at all (t_send filled in later by the
@@ -358,40 +673,96 @@ pub async fn read(
     let cold_confirmed = pending.len();
     println!("# control done: {cold_confirmed} cold, {warm_at_start} already readable");
 
-    // Send a probe for every pending key, THEN drain whatever comes back and
-    // match it by key. Send-then-wait-per-key does not work here: an abandoned
-    // response is never consumed, so after a few rounds the unread replies
-    // backpressure the socket and the next send blocks forever — the node has
-    // not "stopped accepting requests", this client stopped reading.
+    // Probe in BOUNDED rounds, then drain and match by key.
+    //
+    // Two failures have to be avoided at once, and the obvious fix for each is
+    // the other one's bug:
+    //
+    //  - Send-then-wait per key does not work: an abandoned response is never
+    //    consumed, the unread replies backpressure the socket, and the next
+    //    send blocks forever.
+    //  - Probing EVERY pending key in one burst does not work either, and this
+    //    is the one that killed a 200-key run: a GET for a key no node has yet
+    //    may never be answered at all, so the outstanding requests only grow,
+    //    the socket backpressures, and `send_req` trips its bound. It surfaces
+    //    as "the node stopped accepting requests" while the node is healthy —
+    //    the harness had stopped collecting.
+    //
+    // So a round probes at most [`BURST`] keys and rotates through the rest.
+    // That bounds what can be outstanding at any instant by something that
+    // does not depend on how many keys the run has — at the price of
+    // resolution, which the run PRINTS rather than leaves to be discovered: a
+    // key's first-readable time is resolved to a full cycle, not to one probe
+    // period.
     let mut first_reads = Vec::new();
-    let deadline = std::time::Instant::now() + Duration::from_secs(limit_secs);
+    let rounds_per_cycle = pending.len().div_ceil(BURST).max(1);
+    println!(
+        "# probe grid: one probe at a time, up to {} ms each, {BURST} keys per round, \
+         {rounds_per_cycle} round(s) per cycle — a first-readable time is resolved to about \
+         {} ms, which is what a key waits between two looks at it",
+        PROBE_ONE.as_millis(),
+        rounds_per_cycle as u128 * BURST as u128 * PROBE_ONE.as_millis()
+    );
+    let mut cursor = 0usize;
+    let mut rounds = 0usize;
+    let mut sends = 0usize;
+    // A heartbeat, because in the case this loop is hardest on — every key
+    // cold, so no READ line will ever be printed — it otherwise produces NO
+    // output at all. A wedged reader and a working one then look identical
+    // from outside, which is exactly what happened: 65 minutes of nothing,
+    // indistinguishable from 65 minutes of work. Progress has to be visible
+    // before anything can watch for it.
+    let mut last_beat = std::time::Instant::now();
     while !pending.is_empty() && std::time::Instant::now() < deadline {
-        for (_, id, _, _) in &pending {
-            send_req(
-                &mut client,
-                ClientRequest::ContractOp(ContractRequest::Get {
-                    key: *id,
-                    return_contract_code: return_code,
-                    subscribe: false,
-                    blocking_subscribe: false,
-                }),
-                Duration::from_secs(30),
-            )
-            .await?;
-        }
-        // Drain for one probe period, crediting every answer that names a
-        // pending key.
-        let round_end = std::time::Instant::now() + Duration::from_millis(probe_ms);
+        // ONE probe at a time, send then read — the only pattern with any
+        // evidence behind it.
+        //
+        // The batched form (send N, then drain) blocked its send at probe 3 of
+        // a round, then 13, then 8, then 27, then 14. Batching was tried three
+        // ways — a cap on outstanding requests, a cancel-and-reconnect, a fresh
+        // socket per round — and every one of them still died, at 1,900 then
+        // 2,432 then 7,904 probes. Those looked like a progression and are not:
+        // the same binary later died in its FIRST round, so the failure is
+        // non-deterministic and single runs of it measure nothing. The
+        // difference between those numbers was noise I read as a slope.
+        //
+        // What has never failed is this: the cold control pass above sends one
+        // probe, waits for its answer, and walks all 240 keys — in every run
+        // today, including the ones that died seconds later in the batched
+        // loop. So the rounds use the control pass's own call.
+        //
+        // It costs a bounded wait per key rather than per round, so the cycle
+        // is `keys x PROBE_ONE` and the run PRINTS that. A first-readable time
+        // is resolved to a cycle. This is slower than the batched form was
+        // supposed to be, and it is the form that finishes.
         let mut seen: Vec<ContractInstanceId> = Vec::new();
-        while let Some(left) = round_end.checked_duration_since(std::time::Instant::now()) {
-            match timeout(left, client.recv()).await {
-                Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
-                    key: k,
-                    ..
-                }))) => seen.push(*k.id()),
-                Ok(Ok(_)) | Ok(Err(_)) => {}
-                Err(_) => break,
+        let n = BURST.min(pending.len());
+        for step in 0..n {
+            if std::time::Instant::now() >= deadline {
+                break;
             }
+            let (_, id, _, _) = &pending[(cursor + step) % pending.len()];
+            if probe_once(&mut client, id, return_code, PROBE_ONE)
+                .await?
+                .is_some()
+            {
+                seen.push(*id);
+            }
+        }
+        cursor = (cursor + n) % pending.len();
+        rounds += 1;
+        sends += n;
+        if last_beat.elapsed() >= Duration::from_secs(5) {
+            last_beat = std::time::Instant::now();
+            println!(
+                "# alive: round {rounds}, {sends} probes sent, {} read, {} still cold, \
+                 {:.0} s of {limit_secs}",
+                first_reads.len(),
+                pending.len(),
+                started.elapsed().as_secs_f64()
+            );
+            use std::io::Write as _;
+            let _ = std::io::stdout().flush();
         }
         let hit_at = now_ns();
         let mut still = Vec::with_capacity(pending.len());
@@ -406,9 +777,19 @@ pub async fn read(
         }
         pending = still;
     }
+    let ran_out = std::time::Instant::now() >= deadline;
     for (id_s, _, _, size) in &pending {
         println!("MISS {id_s} {size} not readable within {limit_secs} s");
     }
+    println!(
+        "# stopped after {:.0} s because {}",
+        started.elapsed().as_secs_f64(),
+        if ran_out {
+            "the run reached its limit — the MISSes above are 'not within the limit', NOT 'never'"
+        } else {
+            "every key had been read"
+        }
+    );
     let _ = client.send(ClientRequest::Disconnect { cause: None }).await;
     println!(
         "# cold-confirmed={cold_confirmed} void(warm at start)={warm_at_start} \
@@ -425,6 +806,24 @@ pub async fn read(
     }
     Ok(())
 }
+
+/// How many probes one ROUND sends.
+///
+/// This bounds a burst. It does NOT bound the leak — see [`OUTSTANDING_CAP`].
+const BURST: usize = 32;
+
+/// How long one probe waits for its answer.
+///
+/// Short, and it sets the instrument's RESOLUTION: the cycle is
+/// `pending keys x this`, so 20 ms over 200 keys was a 4,480 ms grid — wide
+/// enough to leave the arms' 532 ms difference unmeasured. A node that holds
+/// the block answers from its own store in about a millisecond; one that does
+/// not will never answer, however long the wait. So waiting longer buys
+/// nothing and costs every other key its place in the cycle.
+///
+/// A probe cut short is not a lost measurement: the key stays pending and is
+/// found on the next pass, one cycle later.
+const PROBE_ONE: Duration = Duration::from_millis(5);
 
 /// One bounded GET. `Some(len)` when this node served the state.
 /// `bound` is how long to wait for the ANSWER, not for the send.
@@ -472,11 +871,71 @@ async fn probe_once(
         Duration::from_secs(30),
     )
     .await?;
-    match timeout(bound, client.recv()).await {
-        Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse { state, .. }))) => {
-            Ok(Some(state.as_ref().len()))
+    // Keyed, and it has to be. The drain above matches by key; this branch did
+    // not, so ANY GetResponse satisfied ANY probe and one key's answer was
+    // credited to another key's wait. With one probe per key that is not a
+    // rare mix-up, it is the normal case: the far-node reader reported all 200
+    // keys readable in 15.7 s while the writer was still sending for 24.0 s,
+    // and the pairing guard refused exactly half the pairs as "the hit
+    // preceded its send". The same defect the latency module names
+    // `the_old_next_response_wins_logic`.
+    //
+    // Answers for other keys are consumed and discarded until this key's
+    // answer arrives or the bound expires, so a foreign answer costs this
+    // probe time but never a false hit.
+    // `Awaiting` rather than a second hand-rolled comparison: this crate
+    // already owns one implementation of "is this the answer I asked for",
+    // with its own tests, and the reason this branch was wrong is that xnode
+    // did not use it.
+    let end = std::time::Instant::now() + bound;
+    let mut waiting = crate::latency::Awaiting::new(*id);
+    loop {
+        let Some(left) = end.checked_duration_since(std::time::Instant::now()) else {
+            return Ok(None);
+        };
+        let (arrived, len) = match timeout(left, client.recv()).await {
+            Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
+                key: k,
+                state,
+                ..
+            }))) => (Some(*k.id()), Some(state.as_ref().len())),
+            Ok(Ok(_)) => (None, None),
+            Ok(Err(_)) | Err(_) => return Ok(None),
+        };
+        if waiting.offer(arrived.as_ref()) {
+            return Ok(len);
         }
-        Ok(Ok(_)) | Ok(Err(_)) | Err(_) => Ok(None),
+    }
+}
+
+/// Which arm a trial belongs to.
+///
+/// Assigned at MINT time and INTERLEAVED, so the two arms share the link's
+/// weather rather than one running before the other. A block's key is known
+/// before it is put, so the assignment cannot depend on anything the put
+/// observes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Arm {
+    /// Never re-puts. Its population is computed from its own ack times.
+    Control,
+    /// Re-puts at T when no acknowledgement has arrived.
+    Hedge,
+}
+
+impl Arm {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Arm::Control => "control",
+            Arm::Hedge => "hedge",
+        }
+    }
+    fn parse(s: &str) -> Arm {
+        match s {
+            "hedge" => Arm::Hedge,
+            // A file minted before arms existed is all control, which is what
+            // a run with no hedge is.
+            _ => Arm::Control,
+        }
     }
 }
 
@@ -485,8 +944,20 @@ async fn probe_once(
 pub struct Send {
     pub key: String,
     pub sent_ns: u128,
-    pub confirm_ms: f64,
+    /// When the WRITER could first read it back, if it ever could. `None` is
+    /// "the writer never served it within the run" — a different fact from
+    /// 0 ms, and the parser must not collapse them.
+    pub confirm_ms: Option<f64>,
     pub size: usize,
+    pub arm: Arm,
+    /// Was this trial still unacknowledged when T came round? Taken in BOTH
+    /// arms, so "the population a hedge fires on" means the same thing on each
+    /// side of the comparison. `None` when the run had no T.
+    pub unacked_at_t: Option<bool>,
+    /// Did a hedge actually fire here?
+    pub hedged: bool,
+    /// ms from the send to this key's acknowledgement, where one arrived.
+    pub ack_ms: Option<f64>,
 }
 
 /// One reader line: the key and the absolute time this node first served it.
@@ -497,11 +968,28 @@ pub struct Hit {
     pub at_ms: f64,
 }
 
+/// One sound pair: how long until the FAR node served it, beside everything
+/// the writer knew about the same trial.
+///
+/// One row rather than two parallel lists. The conditional comparison and the
+/// ack-versus-far-readability question are asked of the same trials, and two
+/// vectors that have to stay in step are a way to ask them of different ones.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Joined {
+    pub size: usize,
+    /// ms from the writer's send until the far node first served the block.
+    pub far_ms: f64,
+    pub arm: Arm,
+    pub unacked_at_t: Option<bool>,
+    pub hedged: bool,
+    pub ack_ms: Option<f64>,
+}
+
 /// What pairing produced, including everything it REFUSED.
 #[derive(Debug, Default, PartialEq)]
 pub struct Paired {
-    /// (size, delta_ms) for every sound pair.
-    pub deltas: Vec<(usize, f64)>,
+    /// Every sound pair.
+    pub deltas: Vec<Joined>,
     /// Hits whose delta came out negative — impossible, so refused.
     pub refused_negative: usize,
     /// Hits naming a key the writer never reported sending.
@@ -526,8 +1014,148 @@ pub fn pair(sends: &[Send], hits: &[Hit]) -> Paired {
                 if d < 0.0 {
                     out.refused_negative += 1;
                 } else {
-                    out.deltas.push((h.size, d));
+                    out.deltas.push(Joined {
+                        size: h.size,
+                        far_ms: d,
+                        arm: s.arm,
+                        unacked_at_t: s.unacked_at_t,
+                        hedged: s.hedged,
+                        ack_ms: s.ack_ms,
+                    });
                 }
+            }
+        }
+    }
+    out
+}
+
+/// The smallest conditioned population this instrument draws a comparison
+/// from.
+///
+/// A hedge fires on a minority of writes, so the population that matters is a
+/// fraction of the trials — and two arms of eight tell you about the eight.
+/// Below this the run says NO FINDING and prints the count, rather than a p50
+/// over a handful that reads like a result.
+pub const FLOOR: usize = 20;
+
+/// May this run be read as a comparison at all?
+///
+/// A decision rather than a printed sentence, so a test can put a population
+/// on each side of the floor and watch it change. A floor asserted against
+/// itself is not a floor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    /// The smaller conditioned arm is below [`FLOOR`].
+    NoFinding { smaller_arm: usize },
+    /// Both arms reached the floor.
+    Comparable { smaller_arm: usize },
+}
+
+pub fn verdict(rows: &[Joined]) -> Verdict {
+    let smaller_arm = [Arm::Control, Arm::Hedge]
+        .into_iter()
+        .map(|a| conditional(rows, a).n)
+        .min()
+        .unwrap_or(0);
+    if smaller_arm < FLOOR {
+        Verdict::NoFinding { smaller_arm }
+    } else {
+        Verdict::Comparable { smaller_arm }
+    }
+}
+
+/// One arm's conditioned population: the trials that were still unacknowledged
+/// when T came round.
+#[derive(Debug, Default, PartialEq)]
+pub struct Conditioned {
+    pub n: usize,
+    /// Time until the FAR node served it, for the trials it served.
+    pub far: Vec<f64>,
+    /// The acknowledgement, for the trials that got one. Reported BESIDE the
+    /// far-node number rather than instead of it: #11 measured the ack, and
+    /// the whole point of this run is that an ack is not the thing the engine
+    /// waits on.
+    pub ack: Vec<f64>,
+    /// Trials that never acknowledged at all. They are in `n`, and they are
+    /// the most unacknowledged trials there are.
+    pub never_acked: usize,
+    /// Trials the far node never served within the run.
+    pub never_far: usize,
+}
+
+/// Split the sound pairs into the two arms' conditioned populations.
+///
+/// The condition is `unacked_at_t == Some(true)` in BOTH arms — the mark the
+/// writer took at each trial's own T, whether or not it acted on it. A
+/// whole-arm comparison is diluted by the trials a hedge never touches, which
+/// is what freenet-harness#11 found and what makes this the only comparison
+/// worth printing.
+pub fn conditional(rows: &[Joined], arm: Arm) -> Conditioned {
+    let mut out = Conditioned::default();
+    for r in rows
+        .iter()
+        .filter(|r| r.arm == arm && r.unacked_at_t == Some(true))
+    {
+        out.n += 1;
+        out.far.push(r.far_ms);
+        match r.ack_ms {
+            Some(a) => out.ack.push(a),
+            None => out.never_acked += 1,
+        }
+    }
+    out
+}
+
+/// Does the acknowledgement predict readability on another node at all?
+///
+/// The question freenet-harness#11 could not ask. An ack that arrives AFTER
+/// the far node is already serving the block is not a signal a writer could
+/// have waited on; a block readable elsewhere with no ack at all says the same
+/// thing more strongly.
+#[derive(Debug, Default, PartialEq)]
+pub struct Proxy {
+    /// Pairs where both an ack and a far-node read exist.
+    pub both: usize,
+    /// ...of which the FAR node served the block CLEARLY before the ack.
+    pub far_first: usize,
+    /// ...and the other way round.
+    pub ack_first: usize,
+    /// ...and those whose order the clock bound cannot settle.
+    pub within_margin: usize,
+    /// `ack_ms - far_ms` for those pairs: positive means the far node was
+    /// first, so the ack told the writer nothing it did not already have.
+    pub gaps: Vec<f64>,
+    /// Readable on the far node, never acknowledged. The ack cannot be a
+    /// precondition for these, and no clock correction can change that.
+    pub far_without_ack: usize,
+}
+
+/// Which came first, the acknowledgement or the far node serving the block?
+///
+/// `margin_ms` is the clock bound, and it is not optional. The ack is timed on
+/// the WRITER's clock and the far read on the READER's, so their difference
+/// carries whatever the two clocks disagree by — and a run that reported "the
+/// far node was first" for a 40 ms gap between two machines synchronised to a
+/// few hundred milliseconds would be reporting the clocks. Pairs inside the
+/// margin are counted as undecided rather than assigned to a side.
+///
+/// `far_without_ack` needs no margin at all: no clock correction turns an
+/// acknowledgement that never arrived into one that did.
+pub fn proxy(rows: &[Joined], margin_ms: f64) -> Proxy {
+    let mut out = Proxy::default();
+    for r in rows {
+        match r.ack_ms {
+            None => out.far_without_ack += 1,
+            Some(a) => {
+                out.both += 1;
+                if r.far_ms + margin_ms < a {
+                    out.far_first += 1;
+                } else if a + margin_ms < r.far_ms {
+                    out.ack_first += 1;
+                } else {
+                    out.within_margin += 1;
+                }
+                out.gaps.push(a - r.far_ms);
             }
         }
     }
@@ -553,7 +1181,7 @@ pub fn stimulus_ok(expected: usize, sent: usize, confirmed: usize) -> Result<(),
 /// Pair a writer's PUT lines against a reader's READ lines and print the
 /// table — including everything refused, so a reader cannot quietly drop the
 /// impossible values that reveal a mispaired run.
-pub fn pair_files(put_file: &str, read_file: &str) -> Result<()> {
+pub fn pair_files(put_file: &str, read_file: &str, margin_ms: f64, grid_ms: f64) -> Result<()> {
     let put = std::fs::read_to_string(put_file)
         .map_err(|e| anyhow!("{put_file}: {e} — run the put role first"))?;
     let read = std::fs::read_to_string(read_file)
@@ -565,8 +1193,18 @@ pub fn pair_files(put_file: &str, read_file: &str) -> Result<()> {
             (f.first() == Some(&"PUT") && f.len() >= 5).then(|| Send {
                 key: f[1].to_string(),
                 sent_ns: f[2].parse().unwrap_or(0),
-                confirm_ms: f[3].parse().unwrap_or(0.0),
+                confirm_ms: f[3].parse().ok(),
                 size: f[4].parse().unwrap_or(0),
+                // Absent in a file written before arms existed, which is a
+                // run with no hedge: all control, no mark, nothing fired.
+                arm: f.get(5).map(|a| Arm::parse(a)).unwrap_or(Arm::Control),
+                unacked_at_t: match f.get(6) {
+                    Some(&"unacked") => Some(true),
+                    Some(&"acked") => Some(false),
+                    _ => None,
+                },
+                hedged: f.get(7) == Some(&"hedged"),
+                ack_ms: f.get(8).and_then(|a| a.parse().ok()),
             })
         })
         .collect();
@@ -598,8 +1236,8 @@ pub fn pair_files(put_file: &str, read_file: &str) -> Result<()> {
         );
     }
     let mut by: std::collections::BTreeMap<usize, Vec<f64>> = Default::default();
-    for (size, d) in &p.deltas {
-        by.entry(*size).or_default().push(*d);
+    for j in &p.deltas {
+        by.entry(j.size).or_default().push(j.far_ms);
     }
     let mut t = Table::new(["size", "n", "readable elsewhere p50", "min", "max"]);
     for (size, v) in &by {
@@ -613,7 +1251,165 @@ pub fn pair_files(put_file: &str, read_file: &str) -> Result<()> {
         ]);
     }
     print!("{t}");
+    if grid_ms > 0.0 {
+        let g = Grid { ms: grid_ms };
+        println!("{}", g.line());
+        for (size, v) in &by {
+            if let Some(s) = Summary::of(v) {
+                if let Some(note) = g.unresolved(&kib(*size), &s) {
+                    println!("  {note}");
+                }
+            }
+        }
+    }
+    report_hedge(&p.deltas, margin_ms, grid_ms);
     Ok(())
+}
+
+/// The two tables this run exists for: the conditional comparison, and whether
+/// the acknowledgement predicts far-node readability at all.
+///
+/// Silent when the run had no arms, because a file from a no-hedge run has
+/// nothing to say about a hedge and a table of dashes reads like one that does.
+pub fn report_hedge(rows: &[Joined], margin_ms: f64, grid_ms: f64) {
+    if !rows.iter().any(|r| r.unacked_at_t.is_some()) {
+        return;
+    }
+    let p50 = |v: &[f64]| {
+        Summary::of(v)
+            .map(|s| format!("{:.1}", s.p50))
+            .unwrap_or("-".into())
+    };
+    let p90 = |v: &[f64]| {
+        Summary::of(v)
+            .map(|s| format!("{:.1}", s.p90))
+            .unwrap_or("-".into())
+    };
+
+    println!();
+    println!(
+        "CONDITIONAL — only the trials still UNACKNOWLEDGED at T, which is the \
+         population a hedge fires on"
+    );
+    let mut t = Table::new([
+        "arm",
+        "n",
+        "readable elsewhere p50",
+        "p90",
+        "ack p50",
+        "p90",
+        "never acked",
+    ]);
+    for arm in [Arm::Control, Arm::Hedge] {
+        let c = conditional(rows, arm);
+        t.row([
+            arm.as_str().to_string(),
+            c.n.to_string(),
+            p50(&c.far),
+            p90(&c.far),
+            p50(&c.ack),
+            p90(&c.ack),
+            c.never_acked.to_string(),
+        ]);
+    }
+    print!("{t}");
+    if grid_ms > 0.0 {
+        let g = Grid { ms: grid_ms };
+        for arm in [Arm::Control, Arm::Hedge] {
+            let c = conditional(rows, arm);
+            if let Some(s) = Summary::of(&c.far) {
+                if let Some(note) = g.unresolved(&format!("{} far-read", arm.as_str()), &s) {
+                    println!("  {note}");
+                }
+            }
+        }
+        println!(
+            "  the ack column is on the WRITER's own clock and is not on this grid; the \
+             far-read column is."
+        );
+    }
+    // The comparison this run exists to make is a DIFFERENCE BETWEEN ARMS, and
+    // a difference smaller than one grid step is not resolved — however many
+    // trials produced it. `Grid::unresolved` asks a different question (does
+    // one SERIES' whole spread fit inside a step), and it stays silent here
+    // because the spreads are wide while the gap between them is not.
+    if grid_ms > 0.0 {
+        let c = conditional(rows, Arm::Control);
+        let h = conditional(rows, Arm::Hedge);
+        for (what, a, b) in [
+            (
+                "p50",
+                Summary::of(&c.far).map(|x| x.p50),
+                Summary::of(&h.far).map(|x| x.p50),
+            ),
+            (
+                "p90",
+                Summary::of(&c.far).map(|x| x.p90),
+                Summary::of(&h.far).map(|x| x.p90),
+            ),
+        ] {
+            if let (Some(a), Some(b)) = (a, b) {
+                let d = (a - b).abs();
+                if d < grid_ms {
+                    println!(
+                        "  NOT RESOLVED at {what}: the arms differ by {d:.0} ms, inside one \
+                         {grid_ms:.0} ms step. This instrument cannot tell that apart from no \
+                         difference at all — it is not a small effect, it is an unmeasured one."
+                    );
+                } else {
+                    println!(
+                        "  resolved at {what}: the arms differ by {d:.0} ms, more than one \
+                         {grid_ms:.0} ms step"
+                    );
+                }
+            }
+        }
+    }
+    if let Verdict::NoFinding { smaller_arm } = verdict(rows) {
+        println!(
+            "NO FINDING: the smaller conditioned arm has {smaller_arm} trials, below the floor \
+             of {FLOOR}. The numbers above describe those trials and nothing else — they are \
+             not evidence that a hedge does or does not help."
+        );
+    }
+
+    let fired = rows.iter().filter(|r| r.hedged).count();
+    let eligible = rows.iter().filter(|r| r.arm == Arm::Hedge).count();
+    if eligible > 0 {
+        println!(
+            "fire rate: {fired} of {eligible} hedge-arm trials ({:.0} %)",
+            100.0 * fired as f64 / eligible as f64
+        );
+    }
+
+    let x = proxy(rows, margin_ms);
+    println!();
+    println!("DOES THE ACK PREDICT FAR-NODE READABILITY?");
+    println!(
+        "  clock margin: ±{margin_ms:.0} ms. The ack is on the writer's clock and the far read \
+         on the reader's, so an order inside this is not decided."
+    );
+    println!(
+        "  readable elsewhere with NO acknowledgement at all: {} of {} pairs  \
+         (no clock correction changes these)",
+        x.far_without_ack,
+        rows.len()
+    );
+    println!(
+        "  of the {} pairs with both: far node first {}, ack first {}, undecided {}",
+        x.both, x.far_first, x.ack_first, x.within_margin
+    );
+    println!(
+        "  ack - readable-elsewhere (ms, positive = the far node was first): p50 {} p90 {}",
+        p50(&x.gaps),
+        p90(&x.gaps)
+    );
+    if x.far_without_ack > 0 || x.far_first > 0 {
+        println!(
+            "  An ack that arrives after the block is already being served elsewhere is not a \
+             signal a writer could have waited on."
+        );
+    }
 }
 
 /// Print this machine's clock against a reference, so a cross-machine
@@ -627,6 +1423,22 @@ pub fn stamp() -> Result<()> {
 /// argument-count lint rather than growing a tenth positional parameter.
 pub struct ReadOpts {
     pub keys: String,
+    /// T for the hedge, in seconds; 0 turns it off and the run is exactly the
+    /// one that existed before arms did.
+    pub hedge_secs: f64,
+    /// How far apart the two machines' clocks may be, in ms. Measured, never
+    /// assumed: the `clock` role prints each machine's stamp, and the run that
+    /// produced these files reports what it could bound them to.
+    pub clock_margin_ms: f64,
+    /// Stop the put role once BOTH arms hold this many trials that were still
+    /// unacknowledged at T — the population the comparison is made over. The
+    /// milestone, not a clock; 0 means run the whole plan.
+    pub until_conditioned: usize,
+    /// The READER's probe grid, in ms, which it printed at the top of its own
+    /// output: `rounds_per_cycle * probe_ms`. A far-node time is resolved to
+    /// this, not to the probe period, and a series whose whole spread fits
+    /// inside one step measured the instrument.
+    pub grid_ms: f64,
     /// The reader's log, for the `pair` role.
     pub reads: String,
     pub return_code: bool,
@@ -645,8 +1457,18 @@ pub async fn run(
 ) -> Result<()> {
     match role {
         "write" => write(ws, wasm, samples, sizes, wait).await,
-        "mint" => mint_only(wasm, samples, sizes, &opts.keys).await,
-        "put" => put_minted(ws, wasm, &opts.keys, wait).await,
+        "mint" => mint_only(wasm, samples, sizes, &opts.keys, opts.hedge_secs > 0.0).await,
+        "put" => {
+            put_minted(
+                ws,
+                wasm,
+                &opts.keys,
+                (opts.hedge_secs > 0.0).then(|| Duration::from_secs_f64(opts.hedge_secs)),
+                opts.until_conditioned,
+                wait,
+            )
+            .await
+        }
         "read" => {
             read(
                 ws,
@@ -657,7 +1479,7 @@ pub async fn run(
             )
             .await
         }
-        "pair" => pair_files(&opts.keys, &opts.reads),
+        "pair" => pair_files(&opts.keys, &opts.reads, opts.clock_margin_ms, opts.grid_ms),
         "clock" => stamp(),
         other => bail!("unknown role {other}; expected write, read or clock"),
     }
@@ -671,8 +1493,12 @@ mod tests {
         Send {
             key: key.into(),
             sent_ns,
-            confirm_ms: 100.0,
+            confirm_ms: Some(100.0),
             size: 1024,
+            arm: Arm::Control,
+            unacked_at_t: None,
+            hedged: false,
+            ack_ms: None,
         }
     }
     fn h(key: &str, at_ms: f64) -> Hit {
@@ -686,7 +1512,9 @@ mod tests {
     #[test]
     fn a_sound_pair_yields_the_elapsed_time() {
         let p = pair(&[s("a", 1_000_000_000)], &[h("a", 1500.0)]);
-        assert_eq!(p.deltas, vec![(1024, 500.0)]);
+        assert_eq!(p.deltas.len(), 1);
+        assert_eq!(p.deltas[0].far_ms, 500.0);
+        assert_eq!(p.deltas[0].size, 1024);
         assert_eq!(p.refused_negative, 0);
     }
 
@@ -718,7 +1546,8 @@ mod tests {
             &[s("a", 1_000_000_000), s("b", 5_000_000_000)],
             &[h("a", 1200.0), h("b", 1000.0), h("zz", 9.0)],
         );
-        assert_eq!(p.deltas, vec![(1024, 200.0)]);
+        assert_eq!(p.deltas.len(), 1);
+        assert_eq!(p.deltas[0].far_ms, 200.0);
         assert_eq!(p.refused_negative, 1);
         assert_eq!(p.unmatched, 1);
     }
@@ -737,6 +1566,167 @@ mod tests {
         assert!(
             e.contains("confirmations are NOT the stimulus"),
             "must say why: {e}"
+        );
+    }
+
+    fn j(arm: Arm, unacked: Option<bool>, hedged: bool, far: f64, ack: Option<f64>) -> Joined {
+        Joined {
+            size: 1024,
+            far_ms: far,
+            arm,
+            unacked_at_t: unacked,
+            hedged,
+            ack_ms: ack,
+        }
+    }
+
+    /// The comparison is CONDITIONAL, and the condition is the mark taken in
+    /// BOTH arms. A whole-arm comparison is diluted by the trials a hedge
+    /// never touches — measured on #11, where it buried the effect entirely.
+    #[test]
+    fn only_the_trials_unacked_at_t_are_compared() {
+        let rows = vec![
+            j(Arm::Control, Some(true), false, 900.0, Some(3000.0)),
+            j(Arm::Control, Some(false), false, 100.0, Some(80.0)),
+            j(Arm::Hedge, Some(true), true, 400.0, Some(1200.0)),
+            j(Arm::Hedge, Some(false), false, 120.0, Some(90.0)),
+        ];
+        let c = conditional(&rows, Arm::Control);
+        assert_eq!(c.n, 1, "a trial acked before T is not in the population");
+        assert_eq!(c.far, vec![900.0]);
+        let h = conditional(&rows, Arm::Hedge);
+        assert_eq!(h.n, 1);
+        assert_eq!(h.far, vec![400.0]);
+    }
+
+    /// A trial that NEVER acknowledged is the most unacknowledged trial there
+    /// is. Dropping it would select for the trials that recovered, which is
+    /// the population a hedge exists to rescue.
+    #[test]
+    fn a_trial_that_never_acked_counts_and_is_named() {
+        let rows = vec![
+            j(Arm::Control, Some(true), false, 5000.0, None),
+            j(Arm::Control, Some(true), false, 800.0, Some(2000.0)),
+        ];
+        let c = conditional(&rows, Arm::Control);
+        assert_eq!(c.n, 2, "the never-acked trial is in the population");
+        assert_eq!(c.far.len(), 2, "and its far-node time is a measurement");
+        assert_eq!(c.ack.len(), 1, "but it contributes no ack");
+        assert_eq!(c.never_acked, 1, "and it is counted separately");
+    }
+
+    /// A run with no arms must produce no conditioned population at all,
+    /// rather than one made of every trial.
+    #[test]
+    fn a_run_without_a_hedge_has_no_conditioned_population() {
+        let rows = vec![j(Arm::Control, None, false, 100.0, Some(50.0))];
+        assert_eq!(conditional(&rows, Arm::Control), Conditioned::default());
+    }
+
+    /// The question #11 could not ask: an ack arriving after the far node is
+    /// already serving the block is not a signal a writer could have waited on.
+    #[test]
+    fn the_proxy_question_counts_both_ways_round() {
+        let rows = vec![
+            // far node first: the ack told the writer nothing new
+            j(Arm::Control, Some(true), false, 300.0, Some(2000.0)),
+            // ack first
+            j(Arm::Control, Some(true), false, 4000.0, Some(900.0)),
+            // readable elsewhere, never acked at all
+            j(Arm::Hedge, Some(true), true, 700.0, None),
+        ];
+        let x = proxy(&rows, 0.0);
+        assert_eq!(x.both, 2);
+        assert_eq!(x.far_first, 1);
+        assert_eq!(x.far_without_ack, 1);
+        assert_eq!(x.gaps, vec![1700.0, -3100.0]);
+    }
+
+    /// The clock margin must decide the ORDER, not decorate it. A gap smaller
+    /// than the two machines' disagreement is the clocks, and assigning it to
+    /// a side is reporting them as if they were the network.
+    #[test]
+    fn an_ordering_inside_the_clock_margin_is_undecided() {
+        // 40 ms apart, on two clocks bounded to 300 ms.
+        let rows = vec![j(Arm::Control, Some(true), false, 100.0, Some(140.0))];
+        let tight = proxy(&rows, 0.0);
+        assert_eq!(tight.far_first, 1, "with no margin it would be called");
+        let honest = proxy(&rows, 300.0);
+        assert_eq!(honest.far_first, 0);
+        assert_eq!(honest.ack_first, 0);
+        assert_eq!(honest.within_margin, 1);
+        // The control: a gap well outside the margin is still decided, so the
+        // margin is not simply refusing to answer.
+        let wide = vec![j(Arm::Control, Some(true), false, 100.0, Some(5000.0))];
+        assert_eq!(proxy(&wide, 300.0).far_first, 1);
+    }
+
+    /// A block readable elsewhere that was never acknowledged needs no clock
+    /// correction at all, so no margin may hide it.
+    #[test]
+    fn a_far_read_with_no_ack_survives_any_margin() {
+        let rows = vec![j(Arm::Hedge, Some(true), true, 700.0, None)];
+        for margin in [0.0, 300.0, 60_000.0] {
+            assert_eq!(proxy(&rows, margin).far_without_ack, 1, "margin {margin}");
+            assert_eq!(proxy(&rows, margin).both, 0);
+        }
+    }
+
+    /// The floor decides, and it decides at the boundary. One trial short of
+    /// it in EITHER arm is no finding — a run is only as strong as its smaller
+    /// conditioned population.
+    #[test]
+    fn one_trial_short_in_either_arm_is_no_finding() {
+        let arm_of = |arm, n| (0..n).map(move |_| j(arm, Some(true), false, 100.0, None));
+        let full: Vec<Joined> = arm_of(Arm::Control, FLOOR)
+            .chain(arm_of(Arm::Hedge, FLOOR))
+            .collect();
+        assert_eq!(verdict(&full), Verdict::Comparable { smaller_arm: FLOOR });
+        let short: Vec<Joined> = arm_of(Arm::Control, FLOOR)
+            .chain(arm_of(Arm::Hedge, FLOOR - 1))
+            .collect();
+        assert_eq!(
+            verdict(&short),
+            Verdict::NoFinding {
+                smaller_arm: FLOOR - 1
+            }
+        );
+        // And a run with no conditioned trials at all is not a comparison
+        // either — the emptiest case must not fall through to Comparable.
+        assert_eq!(verdict(&[]), Verdict::NoFinding { smaller_arm: 0 });
+    }
+
+    /// The defect that voided run 4, as a script the old logic cannot pass.
+    ///
+    /// `probe_once`'s awaited branch took ANY `GetResponse` as the answer to
+    /// the key it had asked about. With one probe per key that is not a rare
+    /// mix-up, it is the normal case: the far-node reader reported all 200
+    /// keys readable in 15.7 s while the writer was still sending for 24.0 s,
+    /// and the pairing guard refused exactly half the pairs as impossible.
+    #[test]
+    fn a_probe_is_answered_only_by_the_key_it_asked_about() {
+        use crate::latency::Awaiting;
+        let mine = 7u8;
+        let someone_elses = 9u8;
+
+        let mut w = Awaiting::new(mine);
+        assert!(
+            !w.offer(Some(&someone_elses)),
+            "another key's answer ended this probe — that is the whole defect"
+        );
+        assert!(
+            !w.offer(None),
+            "a message with no key is not an answer either"
+        );
+        assert_eq!(w.stale, 2, "and both are counted, not silently dropped");
+        assert!(w.offer(Some(&mine)), "the awaited key's answer ends it");
+
+        // The control: without the keyed check, the first arrival wins and the
+        // probe reports a hit for a key nobody answered about.
+        let first_arrival_wins = |_arrived: Option<&u8>| true;
+        assert!(
+            first_arrival_wins(Some(&someone_elses)),
+            "this is what the old branch did, and it is why the run was void"
         );
     }
 }

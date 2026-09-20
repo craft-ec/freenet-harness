@@ -357,6 +357,38 @@ enum Cmd {
         /// The reader's log, for `--role pair`.
         #[arg(long, default_value = "reads.txt")]
         reads: String,
+        /// Re-put a block that has no acknowledgement after this many seconds.
+        ///
+        /// 0 turns it off, and the run is exactly the one that existed before
+        /// arms did. Above 0 the `mint` role splits the blocks into
+        /// INTERLEAVED control and hedge arms, and `put` takes the
+        /// still-unacknowledged mark in BOTH so the conditional comparison has
+        /// a control in the same state at the same instant (freenet-harness#11).
+        #[arg(long, default_value_t = 0.0)]
+        hedge_secs: f64,
+        /// How far apart the writer's and the reader's clocks may be, in ms.
+        ///
+        /// The `pair` role needs it: the ack is timed on the writer's clock
+        /// and the far read on the reader's, so an ordering inside this margin
+        /// is the clocks, not the network. Measure it with the `clock` role on
+        /// both machines; do not leave it at 0 for a cross-machine run.
+        #[arg(long, default_value_t = 0.0)]
+        clock_margin_ms: f64,
+        /// The READER's probe grid in ms, as it printed at the top of its own
+        /// output. A far-node time is resolved to this, not to the probe
+        /// period, and `pair` flags any series whose whole spread fits inside
+        /// one step — that series measured the instrument.
+        #[arg(long, default_value_t = 0.0)]
+        grid_ms: f64,
+        /// Stop the `put` role once BOTH arms hold this many trials that were
+        /// still unacknowledged at T.
+        ///
+        /// That population IS the measurement — a whole-arm comparison is
+        /// diluted by the trials a hedge never touches — so the run stops when
+        /// it has enough of it rather than when a clock expires. Leave
+        /// `--timeout-secs` as a backstop far beyond it. 0 runs the whole plan.
+        #[arg(long, default_value_t = 0)]
+        until_conditioned: usize,
         #[arg(long, default_value_t = 20)]
         samples: usize,
         #[arg(long, value_delimiter = ',', default_values_t = [1024, 16384, 262144])]
@@ -382,10 +414,24 @@ enum Cmd {
     },
 }
 
+/// How long opening a connection may take before it is a failure.
+///
+/// `connect_async` has no timeout of its own, so every caller in this harness
+/// could hang here forever — and one did: a reader that reconnected to recover
+/// from a blocked send sat inside this call for 65 minutes, having been given
+/// a 180 s run limit, because the limit is checked between operations and this
+/// operation never returned. An unbounded await inside a recovery path is the
+/// recovery becoming the stall.
+const CONNECT: Duration = Duration::from_secs(15);
+
 pub(crate) async fn connect(ws: &str) -> Result<WebApi> {
-    let (stream, _) = tokio_tungstenite::connect_async(ws)
-        .await
-        .map_err(|e| anyhow!("cannot reach the node at {ws}: {e}"))?;
+    let (stream, _) = match timeout(CONNECT, tokio_tungstenite::connect_async(ws)).await {
+        Ok(r) => r.map_err(|e| anyhow!("cannot reach the node at {ws}: {e}"))?,
+        Err(_) => bail!(
+            "cannot reach the node at {ws}: the connection did not open within {} s",
+            CONNECT.as_secs()
+        ),
+    };
     Ok(WebApi::start(stream))
 }
 
@@ -762,6 +808,10 @@ async fn main() -> Result<()> {
             wasm,
             keys,
             reads,
+            hedge_secs,
+            clock_margin_ms,
+            grid_ms,
+            until_conditioned,
             samples,
             sizes,
             return_code,
@@ -777,6 +827,10 @@ async fn main() -> Result<()> {
                 xnode::ReadOpts {
                     keys,
                     reads,
+                    hedge_secs,
+                    clock_margin_ms,
+                    grid_ms,
+                    until_conditioned,
                     return_code,
                     probe_ms,
                     limit_secs,

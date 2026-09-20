@@ -40,6 +40,34 @@ budget (`--budget-secs`), and what is not back by then is recorded as `not
 within T`. A missing value is a data point. See also the workspace rule of the
 same name.
 
+**A blocked SEND is this harness, not the node.** A reader probing 200 cold
+keys sent a GET for every one of them before reading anything. A GET for a key
+no node holds is never answered, so nothing drained, the socket backpressured,
+and the run's only output was "the node stopped accepting requests" — about a
+node that was serving perfectly well. Probes go out in bounded rounds now, and
+the message names what the caller had not drained. Before writing that a node
+refused anything, show the harness was still collecting.
+
+**A polled instrument's resolution is its ROUND, not its probe period.** When
+the reader rotates 32 keys per round, a run of 200 keys resolves a first-read
+to `ceil(200/32) x probe_ms`, which at 250 ms is 1750 ms and not 250. It is
+printed above the table, and `pair` flags any series whose whole spread fits
+inside one step. Choosing how many keys a run carries is therefore choosing its
+resolution as well as its population — say which one you traded.
+
+**A run that prints nothing until it ends cannot be told from a wedged one.**
+Seventy seconds into a 25-minute put run, `grep -c '^PUT'` returned 0, because
+that role reported nothing until its final phase. Per-trial progress and a 30 s
+heartbeat, always.
+
+**Kill by the PID you recorded at launch, never by a name pattern.** Stopping a
+run with `ps aux | grep "[f]reenet-harness" | awk '{print $2}' | xargs kill`
+also killed another session's `freenet-harness-ro` — a superstring of the name
+— and that session lost two live measurements. The process list being killed
+from had their PIDs in it, printed two lines above. If a pattern is
+unavoidable, carry your own run's unique argument and PRINT what it matched
+before killing anything.
+
 **Keep one built tree per repo, and delete a target dir as soon as its gate is
 green.** Four Rust trees plus wasm targets took this machine to 168 MiB free and
 killed a tool call mid-run.
