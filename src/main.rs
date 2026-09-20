@@ -8,6 +8,7 @@ mod putshape;
 mod register;
 mod set;
 mod stats;
+mod upgrade;
 mod validate_cost;
 mod wasm_check;
 mod watch;
@@ -196,6 +197,32 @@ enum Cmd {
         /// between passes can be measured, and the run says so.
         #[arg(long, default_value_t = 120)]
         probe_ms: u64,
+    },
+    /// One full contract-code epoch change: put under code A, read through a
+    /// [B, A] table, lazily re-put under B, then read under B alone — plus the
+    /// Register half and the rollback hazard. Part of freenet-contracts#8.
+    UpgradeCycle {
+        #[arg(long, default_value = "build/epochs/block-A.wasm")]
+        block_a: String,
+        #[arg(long, default_value = "build/epochs/block-B.wasm")]
+        block_b: String,
+        #[arg(long)]
+        sha_block_a: String,
+        #[arg(long)]
+        sha_block_b: String,
+        #[arg(long, default_value = "build/epochs/register-A.wasm")]
+        register_a: String,
+        #[arg(long, default_value = "build/epochs/register-B.wasm")]
+        register_b: String,
+        #[arg(long)]
+        sha_register_a: String,
+        #[arg(long)]
+        sha_register_b: String,
+        /// Blocks to migrate.
+        #[arg(long, default_value_t = 20)]
+        n: usize,
+        #[arg(long, default_value_t = 4096)]
+        size: usize,
     },
     /// Set contract live-node round trip. Runs in --local.
     Set {
@@ -674,6 +701,35 @@ async fn main() -> Result<()> {
                 budget_secs,
                 probe_ms,
                 wait,
+            )
+            .await?;
+        }
+        Cmd::UpgradeCycle {
+            block_a,
+            block_b,
+            sha_block_a,
+            sha_block_b,
+            register_a,
+            register_b,
+            sha_register_a,
+            sha_register_b,
+            n,
+            size,
+        } => {
+            upgrade::run(
+                &ws,
+                upgrade::Opts {
+                    block_a,
+                    block_b,
+                    sha_block_a,
+                    sha_block_b,
+                    register_a,
+                    register_b,
+                    sha_register_a,
+                    sha_register_b,
+                    n,
+                    size,
+                },
             )
             .await?;
         }

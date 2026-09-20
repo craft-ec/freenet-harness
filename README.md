@@ -43,3 +43,36 @@ same name.
 **Keep one built tree per repo, and delete a target dir as soon as its gate is
 green.** Four Rust trees plus wasm targets took this machine to 168 MiB free and
 killed a tool call mid-run.
+
+## Epoch artefacts for `upgrade-cycle`
+
+`upgrade-cycle` needs two builds of each contract, from two real commits, so a
+code upgrade can be demonstrated rather than described. **Neither side is a
+fixture** — both are contracts this project has shipped. `build/` is not
+tracked, so they are rebuilt rather than committed:
+
+| file | bytes | sha256 | built from |
+|---|---|---|---|
+| `block-A.wasm` | 118,807 | `21ae7e734d40224d` | freenet-contracts `9bf6845`, before the parity rule |
+| `block-B.wasm` | 123,393 | `1521dddb9ecbaa16` | freenet-contracts `201e9bc` |
+| `register-A.wasm` | 157,234 | `a3be5ec412ddb6b4` | freenet-contracts `1c3a710`, before the cost counters |
+| `register-B.wasm` | 152,430 | `e273be8c6f35a739` | freenet-contracts `201e9bc` |
+
+Build each side in a DETACHED worktree, never by moving the shared checkout —
+several sessions work in these folders:
+
+    git -C ../freenet-contracts worktree add --detach /tmp/epoch 9bf6845
+    (cd /tmp/epoch && ./block/build.sh && ./register/build.sh)
+    mkdir -p build/epochs && cp /tmp/epoch/build/*.wasm build/epochs/
+    rm -rf /tmp/epoch/target
+    git -C ../freenet-contracts worktree remove --force /tmp/epoch
+
+Then:
+
+    cargo run -- --local upgrade-cycle \
+      --sha-block-a 21ae7e73 --sha-block-b 1521dddb \
+      --sha-register-a a3be5ec4 --sha-register-b e273be8c --n 100
+
+The run refuses to start if the two hashes on either side are equal: two epochs
+with the same code hash are the same epoch, and every "it moved" it prints would
+be vacuously true.
