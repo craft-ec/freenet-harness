@@ -302,9 +302,18 @@ enum Cmd {
         /// When to hedge, in milliseconds. One arm each, plus the control.
         #[arg(long, value_delimiter = ',', default_values_t = [2000u64, 5000, 10000])]
         ts_ms: Vec<u64>,
-        /// Rounds. Every arm gets round r before any arm gets round r+1.
-        #[arg(long, default_value_t = 30)]
-        n: usize,
+        /// Stop once every T has this many CONDITIONED trials on both sides —
+        /// hedges actually fired, and control trials in the same state at the
+        /// same instant. Sizing by rounds leaves about three per T on a
+        /// one-in-ten tail, which can show neither outcome.
+        #[arg(long, default_value_t = 12)]
+        target_conditioned: usize,
+        /// Below this many conditioned trials a row says "no finding".
+        #[arg(long, default_value_t = 5)]
+        min_report: usize,
+        /// Cap, so a condition with no tail cannot run forever.
+        #[arg(long, default_value_t = 400)]
+        max_rounds: usize,
         /// Deadline for one trial; what is not back by then is `not within T`.
         #[arg(long, default_value_t = 90)]
         trial_secs: u64,
@@ -852,7 +861,9 @@ async fn main() -> Result<()> {
             expect_sha,
             size,
             ts_ms,
-            n,
+            target_conditioned,
+            min_report,
+            max_rounds,
             trial_secs,
             budget_secs,
         } => {
@@ -863,7 +874,9 @@ async fn main() -> Result<()> {
                     expect_sha,
                     size,
                     ts_ms,
-                    n,
+                    target_conditioned,
+                    min_report,
+                    max_rounds,
                     trial_secs,
                     budget_secs,
                 },

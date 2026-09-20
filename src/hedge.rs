@@ -208,14 +208,28 @@ pub struct Opts {
     pub expect_sha: String,
     pub size: usize,
     pub ts_ms: Vec<u64>,
-    pub n: usize,
+    /// Stop once every T has this many CONDITIONED trials — hedges actually
+    /// fired, and control trials that were in the same state at the same
+    /// instant.
+    ///
+    /// Sizing by rounds is what a first version did, and it cannot work: with a
+    /// tail on roughly one put in ten, thirty rounds leaves about THREE
+    /// conditioned trials per T, and three against three can show neither that
+    /// a hedge helps nor that it does not. The second of those is the result
+    /// that would redirect the engine, so it has to be reachable.
+    pub target_conditioned: usize,
+    /// A cell below this many conditioned trials reports "no finding" in words
+    /// rather than a ratio nobody should read.
+    pub min_report: usize,
+    /// A cap, so a condition with no tail at all cannot run forever.
+    pub max_rounds: usize,
     pub trial_secs: u64,
     pub budget_secs: u64,
 }
 
 pub async fn run(ws: &str, o: Opts) -> Result<()> {
-    if o.ts_ms.is_empty() || o.n == 0 {
-        bail!("nothing to measure: --ts-ms and --n must both be non-empty");
+    if o.ts_ms.is_empty() || o.max_rounds == 0 {
+        bail!("nothing to measure: --ts-ms and --max-rounds must both be non-empty");
     }
     let bytes = crate::wasm_check::load(&o.wasm, &o.expect_sha)?;
     let code_len = bytes.len();
@@ -232,6 +246,10 @@ pub async fn run(ws: &str, o: Opts) -> Result<()> {
         o.trial_secs,
         o.budget_secs,
         kib(o.size)
+    );
+    println!(
+        "stop:     when every T has {} conditioned trials on BOTH sides, or at {} rounds, or at the budget",
+        o.target_conditioned, o.max_rounds
     );
     println!();
 
@@ -251,17 +269,51 @@ pub async fn run(ws: &str, o: Opts) -> Result<()> {
     let per_trial = Duration::from_secs(o.trial_secs.max(1));
     let mut cut = false;
 
-    'rounds: for r in 0..o.n {
+    // How many CONDITIONED trials each T has so far, on both sides. The loop
+    // stops on this rather than on a round count, because rounds buy trials the
+    // strategy never touches.
+    let conditioned = |arms: &[Arm], t: Duration| -> (usize, usize) {
+        let ctl = arms
+            .iter()
+            .find(|a| a.t.is_none())
+            .map(|c| {
+                c.trials
+                    .iter()
+                    .filter(|x| x.ack.is_none_or(|a| a > t.as_secs_f64() * 1000.0))
+                    .count()
+            })
+            .unwrap_or(0);
+        let fired = arms
+            .iter()
+            .find(|a| a.t == Some(t))
+            .map(|a| a.trials.iter().filter(|x| x.hedged).count())
+            .unwrap_or(0);
+        (ctl, fired)
+    };
+    let enough = |arms: &[Arm]| -> bool {
+        o.ts_ms.iter().all(|&ms| {
+            let (c, f) = conditioned(arms, Duration::from_millis(ms));
+            c >= o.target_conditioned && f >= o.target_conditioned
+        })
+    };
+
+    let mut rounds = 0usize;
+    let mut cut_reason = "";
+    'rounds: for r in 0..o.max_rounds {
+        if enough(&arms) {
+            cut_reason = "every T reached its conditioned target";
+            break;
+        }
         for arm in arms.iter_mut() {
             if budget.is_some_and(|d| Instant::now() >= d) {
                 cut = true;
+                cut_reason = "the budget";
                 break 'rounds;
             }
             let x = trial(&mut writer, &mut reader, &code, o.size, arm.t, per_trial).await?;
             progress_pub(format_args!(
-                "  {}/{} {:<18} ack {}  readable {}{}",
+                "  r{} {:<18} ack {}  readable {}{}",
                 r + 1,
-                o.n,
                 arm.name(),
                 x.ack.map_or("—".into(), |v| format!("{v:.0} ms")),
                 x.readable.map_or("—".into(), |v| format!("{v:.0} ms")),
@@ -269,6 +321,27 @@ pub async fn run(ws: &str, o: Opts) -> Result<()> {
             ));
             arm.trials.push(x);
         }
+        rounds = r + 1;
+        // Say where the conditioned counts stand, so a long run is legible
+        // while it is happening rather than only at the end.
+        if rounds.is_multiple_of(10) {
+            let state: Vec<String> = o
+                .ts_ms
+                .iter()
+                .map(|&ms| {
+                    let (c, f) = conditioned(&arms, Duration::from_millis(ms));
+                    format!("{}s {c}/{f}", ms / 1000)
+                })
+                .collect();
+            progress_pub(format_args!(
+                "  after {rounds} rounds, conditioned control/hedged per T: {}  (target {})",
+                state.join("  "),
+                o.target_conditioned
+            ));
+        }
+    }
+    if cut_reason.is_empty() {
+        cut_reason = "the round cap";
     }
 
     // ---- the headline table -------------------------------------------------
@@ -359,6 +432,16 @@ pub async fn run(ws: &str, o: Opts) -> Result<()> {
                 pool.len().to_string(),
                 format!("{}/{}", acks.len(), pool.len()),
             ];
+            // A ratio over four samples is a number a reader will quote and
+            // should not. Below the floor the row says so in words instead.
+            if pool.len() < o.min_report {
+                t2.row(head.into_iter().chain([
+                    "no finding".to_string(),
+                    format!("n={} < {}", pool.len(), o.min_report),
+                    String::new(),
+                ]));
+                continue;
+            }
             match Summary::of(&acks) {
                 Some(s) => t2.row(head.into_iter().chain([
                     format!("{:.0}", s.p50),
@@ -406,9 +489,27 @@ pub async fn run(ws: &str, o: Opts) -> Result<()> {
         );
     }
     println!();
+    println!("stopped after {rounds} rounds on {cut_reason}.");
+    println!("conditioned trials per T (control / hedged), which is what these rows rest on:");
+    for &ms in &o.ts_ms {
+        let t = Duration::from_millis(ms);
+        let (c, f) = conditioned(&arms, t);
+        println!(
+            "   {}: {c} / {f}  (target {}){}",
+            secs(t),
+            o.target_conditioned,
+            if c < o.min_report || f < o.min_report {
+                " — TOO FEW, that row reports no finding"
+            } else if c < o.target_conditioned || f < o.target_conditioned {
+                " — under target, treat the row as weak"
+            } else {
+                ""
+            }
+        );
+    }
     if cut {
         println!(
-            "the run reached its {} s budget; the rounds not taken are NOT within it",
+            "the run reached its {} s budget; what it did not reach is NOT within it",
             o.budget_secs
         );
     }
