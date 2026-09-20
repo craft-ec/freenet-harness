@@ -195,6 +195,44 @@ pub(crate) async fn put_container(
     }
 }
 
+/// Deciding what one arriving response IS, for a series waiting on one key.
+///
+/// Pulled out of the receive loops so it can be tested without a node. The
+/// loops differ only in which response variant they unwrap; the decision they
+/// share is this one, and it is the decision that was wrong.
+///
+/// `Awaiting` is deliberately generic over the key: the bug had nothing to do
+/// with contract ids, and a test that needed a live node to reach it would not
+/// have been written.
+pub(crate) struct Awaiting<K> {
+    want: K,
+    /// Answers to requests this series had already given up on.
+    pub(crate) stale: usize,
+}
+
+impl<K: PartialEq> Awaiting<K> {
+    pub(crate) fn new(want: K) -> Self {
+        Awaiting { want, stale: 0 }
+    }
+
+    /// Offer one arrived response. `None` is a response that carries no key at
+    /// all — another operation's kind, or a message this series does not read.
+    ///
+    /// `true` means it is the awaited answer and the caller should stop. Every
+    /// other case is counted and the caller keeps waiting: an answer to an
+    /// earlier request is that request's business, not this one's, and it must
+    /// neither end this wait nor be recorded as this sample's error.
+    pub(crate) fn offer(&mut self, arrived: Option<&K>) -> bool {
+        match arrived {
+            Some(k) if *k == self.want => true,
+            _ => {
+                self.stale += 1;
+                false
+            }
+        }
+    }
+}
+
 /// Put one contract and time the acknowledgement.
 ///
 /// The answer is matched BY KEY, and answers to earlier requests are discarded
@@ -227,30 +265,35 @@ async fn timed_put(
     )
     .await?;
     let deadline = t + wait;
+    let mut waiting = Awaiting::new(key);
     loop {
         let Some(left) = deadline.checked_duration_since(Instant::now()) else {
+            *stale += waiting.stale;
             return Ok(Sample::Failed(format!(
                 "no response within {} s",
                 wait.as_secs()
             )));
         };
-        match timeout(left, client.recv()).await {
+        let arrived = match timeout(left, client.recv()).await {
             Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key: k }))) => {
-                if k == key {
-                    return Ok(Sample::Ms(ms_since(t)));
-                }
-                // Somebody else's answer, arriving late. Not this sample's
-                // latency and not this sample's error.
-                *stale += 1;
+                Some(k)
             }
-            Ok(Ok(_other)) => *stale += 1,
-            Ok(Err(e)) => return Ok(Sample::Failed(format!("node error: {e}"))),
+            Ok(Ok(_other)) => None,
+            Ok(Err(e)) => {
+                *stale += waiting.stale;
+                return Ok(Sample::Failed(format!("node error: {e}")));
+            }
             Err(_) => {
+                *stale += waiting.stale;
                 return Ok(Sample::Failed(format!(
                     "no response within {} s",
                     wait.as_secs()
-                )))
+                )));
             }
+        };
+        if waiting.offer(arrived.as_ref()) {
+            *stale += waiting.stale;
+            return Ok(Sample::Ms(ms_since(t)));
         }
     }
 }
@@ -280,44 +323,49 @@ async fn timed_get(
     )
     .await?;
     let deadline = t + wait;
+    // Keyed, not "the next GetResponse". Comparing an answer for another key
+    // against these bytes reports a state mismatch, which reads as a node fault
+    // and is an instrument fault.
+    let mut waiting = Awaiting::new(*key.id());
     loop {
         let Some(left) = deadline.checked_duration_since(Instant::now()) else {
+            *stale += waiting.stale;
             return Ok(Sample::Failed(format!(
                 "no response within {} s",
                 wait.as_secs()
             )));
         };
-        match timeout(left, client.recv()).await {
+        let (arrived, got) = match timeout(left, client.recv()).await {
             Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
                 key: k,
                 state: got,
                 ..
-            }))) => {
-                // Keyed, not "the next GetResponse". Comparing an answer for
-                // another key against these bytes reports a state mismatch,
-                // which reads as a node fault and is an instrument fault.
-                if k.id() != key.id() {
-                    *stale += 1;
-                    continue;
-                }
-                return Ok(if got.as_ref() == want {
-                    Sample::Ms(ms_since(t))
-                } else {
-                    Sample::Failed(format!(
-                        "state mismatch: got {} B, expected {} B",
-                        got.as_ref().len(),
-                        want.len()
-                    ))
-                });
+            }))) => (Some(*k.id()), Some(got)),
+            Ok(Ok(_other)) => (None, None),
+            Ok(Err(e)) => {
+                *stale += waiting.stale;
+                return Ok(Sample::Failed(format!("node error: {e}")));
             }
-            Ok(Ok(_other)) => *stale += 1,
-            Ok(Err(e)) => return Ok(Sample::Failed(format!("node error: {e}"))),
             Err(_) => {
+                *stale += waiting.stale;
                 return Ok(Sample::Failed(format!(
                     "no response within {} s",
                     wait.as_secs()
-                )))
+                )));
             }
+        };
+        if waiting.offer(arrived.as_ref()) {
+            *stale += waiting.stale;
+            let got = got.expect("a matched GetResponse carries its state");
+            return Ok(if got.as_ref() == want {
+                Sample::Ms(ms_since(t))
+            } else {
+                Sample::Failed(format!(
+                    "state mismatch: got {} B, expected {} B",
+                    got.as_ref().len(),
+                    want.len()
+                ))
+            });
         }
     }
 }
@@ -1422,5 +1470,87 @@ mod tests {
         let deltas: Vec<f64> = rows.iter().filter_map(|r| r.delta_ms()).collect();
         assert_eq!(deltas, [800.0, -800.0]);
         assert_eq!(deltas.iter().filter(|d| **d < 0.0).count(), 1);
+    }
+
+    /// What actually happens on one connection carrying a whole series.
+    ///
+    /// Put 1 times out at its deadline and the series gives up on it. Put 2 is
+    /// issued, and WHILE it is being timed, put 1's acknowledgement finally
+    /// arrives. The question the instrument has to answer is what that is —
+    /// and answering it wrong cost 5 of 30 hotspot samples, every one of them a
+    /// slow sample, which biases a percentile in the flattering direction.
+    fn script() -> Vec<Option<u8>> {
+        vec![
+            Some(1),  // put 1's ack, arriving after put 1 was abandoned
+            None,     // something that is not a PutResponse at all
+            Some(99), // an answer for a key this series has never heard of
+            Some(2),  // and finally put 2's own answer
+        ]
+    }
+
+    #[test]
+    fn a_late_answer_for_an_earlier_key_is_discarded_and_counted_and_the_later_put_keeps_its_sample(
+    ) {
+        let mut w = Awaiting::new(2u8);
+        let mut matched = None;
+        for (i, ev) in script().iter().enumerate() {
+            if w.offer(ev.as_ref()) {
+                matched = Some(i);
+                break;
+            }
+        }
+        assert_eq!(matched, Some(3), "put 2 must still get its own sample");
+        assert_eq!(w.stale, 3, "the three that were not put 2's are counted");
+    }
+
+    /// An answer for a key nobody is waiting for is a fact about the
+    /// connection, not a failure of this sample. It is counted so a run can
+    /// say how far ahead of the node it is running.
+    #[test]
+    fn an_unknown_key_is_counted_and_is_not_fatal() {
+        let mut w = Awaiting::new(2u8);
+        assert!(!w.offer(Some(&99)));
+        assert!(!w.offer(None));
+        assert_eq!(w.stale, 2);
+        assert!(
+            w.offer(Some(&2)),
+            "and the wait continues to its own answer"
+        );
+    }
+
+    /// THE CONTROL. The logic this replaced — the next response wins, anything
+    /// else is an error — run against the same script. It must get it wrong, or
+    /// the tests above are not evidence that anything was fixed.
+    #[test]
+    fn the_old_next_response_wins_logic_fails_this_script() {
+        #[derive(Debug, PartialEq)]
+        enum Old {
+            Sample,
+            Failed,
+        }
+        fn next_response_wins(want: u8, events: &[Option<u8>]) -> Old {
+            match events.first() {
+                Some(Some(k)) if *k == want => Old::Sample,
+                _ => Old::Failed, // "unexpected response"
+            }
+        }
+        assert_eq!(
+            next_response_wins(2, &script()),
+            Old::Failed,
+            "the old logic loses put 2's sample to put 1's late ack"
+        );
+        // And the new one does not.
+        let mut w = Awaiting::new(2u8);
+        assert!(script().iter().any(|e| w.offer(e.as_ref())));
+    }
+
+    /// The count is what makes the loss visible in a table. A matcher that
+    /// silently skipped would behave correctly and report nothing.
+    #[test]
+    fn nothing_is_discarded_silently() {
+        let mut w = Awaiting::new(7u8);
+        assert_eq!(w.stale, 0);
+        assert!(w.offer(Some(&7)));
+        assert_eq!(w.stale, 0, "a clean match discards nothing");
     }
 }
