@@ -156,7 +156,7 @@ async fn put(
     client: &mut crate::probe::Client,
     contract: ContractContainer,
     state: &[u8],
-) -> Result<()> {
+) -> Result<instrument::Label> {
     send_req(
         client,
         ClientRequest::ContractOp(ContractRequest::Put {

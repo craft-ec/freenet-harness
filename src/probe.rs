@@ -61,6 +61,14 @@ pub struct Ledger {
     /// Which request this connection is on, so a send and its answer can be
     /// paired without the node echoing anything back.
     seq: std::sync::atomic::AtomicU64,
+    /// Answers this connection gave up waiting for and is still OWED.
+    ///
+    /// A bounded wait expiring does not cancel anything. The node still owes
+    /// that answer, it arrives later, and the client API carries no
+    /// correlation id — so from the first timeout onwards, pairing an answer
+    /// to a request BY POSITION is shifted by one. It does not go down:
+    /// nothing can prove which later answer settled an owed one.
+    owed: std::sync::atomic::AtomicU64,
 }
 
 impl Default for Ledger {
@@ -77,6 +85,7 @@ impl Ledger {
             last: std::sync::Mutex::new(None),
             labels: std::sync::Mutex::new(Labels::new()),
             seq: std::sync::atomic::AtomicU64::new(0),
+            owed: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -136,6 +145,23 @@ impl Ledger {
             op: OpId(id.ordinal),
             outcome,
         });
+        // Ending an operation the caller never got an answer for does not end
+        // the NODE's obligation. `Timeout` and `Blocked` are the two outcomes
+        // where nothing came back, so from here on an answer may belong to an
+        // operation this ledger has already closed, and pairing the next
+        // answer to the oldest open request would hand it to the wrong one.
+        // That is harness#38: fifteen accepted puts reported as failures
+        // because every answer after the third was the previous put's.
+        if matches!(outcome, Outcome::Timeout | Outcome::Blocked) {
+            self.owed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.rec.event(Event::Counter {
+                site: SEND,
+                entry: Entry {
+                    key: Key::Owed,
+                    value: 1,
+                },
+            });
+        }
         // An operation that ended is no longer outstanding, however it ended.
         // A timeout that left its edge open would be counted twice: once as a
         // failure and again as a request nobody answered.
@@ -143,24 +169,6 @@ impl Ledger {
             if let Some(i) = o.iter().position(|l| *l == id) {
                 o.remove(i);
             }
-        }
-    }
-
-    /// Close the MOST RECENT operation with the caller's outcome.
-    ///
-    /// Honest about its limit: with several requests in flight, "the most
-    /// recent" is not necessarily the one that failed. It is exactly right for
-    /// the shapes that use it — a send that blocked, a single probe that went
-    /// unanswered — because in both the caller sent one request and is
-    /// standing over it. A caller pipelining several and wanting to refine one
-    /// of them should keep the `Label` that `request` handed back.
-    pub fn finish_last(&self, outcome: Outcome) {
-        let id = match self.last.lock() {
-            Ok(l) => *l,
-            Err(p) => *p.into_inner(),
-        };
-        if let Some(id) = id {
-            self.finish(id, outcome);
         }
     }
 
@@ -182,6 +190,20 @@ impl Ledger {
     /// right for the COUNT, which is the number that matters, and it does not
     /// claim to say WHICH request was answered.
     pub fn response(&self) {
+        // Once an answer is owed to an operation nobody is waiting for any
+        // more, position says nothing. Count the answer — it did arrive — and
+        // count that it could not be attributed, but emit NO `Exit` for any
+        // open operation: closing a running one as `Ok` on the strength of
+        // another request's answer is the defect, not the diagnosis.
+        if self.owed.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+            for key in [Key::Received, Key::Ambiguous] {
+                self.rec.event(Event::Counter {
+                    site: RECV,
+                    entry: Entry { key, value: 1 },
+                });
+            }
+            return;
+        }
         let oldest = {
             let mut o = match self.open.lock() {
                 Ok(o) => o,
@@ -230,6 +252,14 @@ impl Ledger {
     pub fn received(&self) -> u64 {
         self.rec.recording().total(Key::Received)
     }
+    /// Answers still owed to operations this connection gave up on.
+    pub fn owed(&self) -> u64 {
+        self.rec.recording().total(Key::Owed)
+    }
+    /// Answers that arrived while [`owed`](Ledger::owed) was non-zero.
+    pub fn ambiguous(&self) -> u64 {
+        self.rec.recording().total(Key::Ambiguous)
+    }
     pub fn dump(&self, what: &'static str) -> String {
         render(&self.rec.recording(), what, 40)
     }
@@ -245,12 +275,21 @@ impl Ledger {
             .map(|(o, n)| format!("{o:?}={n}"))
             .collect();
         let open_spans = self.unfinished();
+        let owed = self.owed();
         format!(
-            "sent {} received {} OUTSTANDING {} running {}{}{}",
+            "sent {} received {} OUTSTANDING {} running {}{}{}{}",
             self.sent(),
             self.received(),
             out.len(),
             open_spans,
+            // Printed only when it happened, and then loudly: every line after
+            // this one is describing a stream whose answers can no longer be
+            // matched to their requests by position.
+            if owed == 0 {
+                String::new()
+            } else {
+                format!(" owed {owed} ambiguous {}", self.ambiguous())
+            },
             if ended.is_empty() {
                 String::new()
             } else {
@@ -297,12 +336,25 @@ impl Client {
         inner
     }
 
-    pub fn send(
-        &mut self,
-        req: ClientRequest<'static>,
-    ) -> impl core::future::Future<Output = Result<(), anyhow::Error>> + '_ {
-        self.ledger.request(describe(&req));
-        async move { self.inner.send(req).await.map_err(Into::into) }
+    /// Send, handing back the operation's [`Label`] BEFORE the future is
+    /// awaited.
+    ///
+    /// The label has to be available without awaiting, because the caller that
+    /// most needs it is the one whose await never returns: a send that sits in
+    /// backpressure past its bound is dropped mid-future, and it must still be
+    /// able to say WHICH operation ended. `finish_last` used to stand in for
+    /// that — "the last request sent on this connection" — and it was wrong in
+    /// the way that cost harness#38: under a concurrent batch the last request
+    /// sent is not the one that timed out.
+    ///
+    /// [`Sent`] is awaitable, so the twenty call sites that do not care are
+    /// unchanged; the two that refine an outcome bind it first and keep `id`.
+    pub fn send(&mut self, req: ClientRequest<'static>) -> Sent<'_> {
+        let id = self.ledger.request(describe(&req));
+        Sent {
+            id,
+            fut: Box::pin(async move { self.inner.send(req).await.map_err(Into::into) }),
+        }
     }
 
     pub async fn recv(&mut self) -> Result<HostResponse, anyhow::Error> {
@@ -323,11 +375,34 @@ impl Client {
         self.ledger.dump(what)
     }
 
-    /// Say how the operation just sent ended, when the caller knows better
-    /// than the transport can: no state came back, a bounded wait expired, the
-    /// bytes were not the ones asked for.
-    pub fn finish_last(&self, outcome: Outcome) {
-        self.ledger.finish_last(outcome)
+    /// Say how a NAMED operation ended, when the caller knows better than the
+    /// transport can: no state came back, a bounded wait expired, the bytes
+    /// were not the ones asked for.
+    ///
+    /// By id, never "the last one". A caller that can identify its own answer
+    /// — a `PutResponse` carries the key — is the only thing that can close a
+    /// specific operation once an answer is owed, because by then position
+    /// has stopped meaning anything.
+    pub fn finish(&self, id: Label, outcome: Outcome) {
+        self.ledger.finish(id, outcome)
+    }
+}
+
+/// A send in progress, carrying the [`Label`] of the operation it started.
+///
+/// Awaitable, so `client.send(req).await` still reads as it did.
+pub struct Sent<'a> {
+    pub id: Label,
+    fut: std::pin::Pin<Box<dyn core::future::Future<Output = Result<(), anyhow::Error>> + 'a>>,
+}
+
+impl core::future::Future for Sent<'_> {
+    type Output = Result<(), anyhow::Error>;
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut core::task::Context<'_>,
+    ) -> core::task::Poll<Self::Output> {
+        self.fut.as_mut().poll(cx)
     }
 }
 
@@ -491,8 +566,8 @@ mod tests {
         // twice, once as a timeout and again as a request nobody answered.
         let gave_up = Ledger::new();
         for _ in 0..3 {
-            gave_up.request("get");
-            gave_up.finish_last(Outcome::Timeout);
+            let id = gave_up.request("get");
+            gave_up.finish(id, Outcome::Timeout);
         }
         assert_eq!(
             gave_up.outstanding().len(),
@@ -515,6 +590,9 @@ mod tests {
             gave_up.line()
         );
         assert!(gave_up.line().contains("Timeout=3"), "{}", gave_up.line());
+        // Three answers were given up on, and the line says so: from here the
+        // node may still answer, and nothing could say which one it settled.
+        assert!(gave_up.line().contains("owed 3"), "{}", gave_up.line());
     }
 
     /// A node that answers "I do not have it" has ANSWERED. That is a miss,
@@ -522,8 +600,8 @@ mod tests {
     #[test]
     fn a_miss_is_an_outcome_not_an_open_edge() {
         let l = Ledger::new();
-        l.request("get");
-        l.finish_last(Outcome::Missing);
+        let id = l.request("get");
+        l.finish(id, Outcome::Missing);
         assert_eq!(l.outstanding().len(), 0);
         assert_eq!(l.outcomes(), vec![(Outcome::Missing, 1)]);
         assert!(l.line().contains("Missing=1"), "{}", l.line());
@@ -556,8 +634,8 @@ mod tests {
     #[test]
     fn refining_an_outcome_does_not_end_the_operation_twice() {
         let l = Ledger::new();
-        l.request("get");
-        l.finish_last(Outcome::Refused(7));
+        let id = l.request("get");
+        l.finish(id, Outcome::Refused(7));
         // The caller spoke first; a later response must not add a second Exit
         // for an operation that already ended.
         let total = |l: &Ledger| l.outcomes().iter().map(|(_, n)| *n).sum::<usize>();
@@ -574,6 +652,119 @@ mod tests {
             l.outcomes(),
             vec![(Outcome::Refused(7), 1)],
             "and it is still the caller's verdict, not the transport's"
+        );
+    }
+
+    /// A late answer after a timeout must not close a DIFFERENT operation.
+    ///
+    /// The review's probe, exactly: request A, A times out, request B, then
+    /// one response — A's late answer. Before the fix this printed
+    /// `sent 2 received 1 OUTSTANDING 0 running 0 ended[Timeout=1 Ok=1]`:
+    /// B was still running, and the ledger said it had ended `Ok`. That is
+    /// harness#38 seen from inside the instrument built to show it.
+    #[test]
+    fn a_late_answer_does_not_close_a_different_operation() {
+        let l = Ledger::new();
+        let a = l.request("put");
+        l.finish(a, Outcome::Timeout);
+        let _b = l.request("put");
+        // A's answer, arriving now. Nothing on the wire says so.
+        l.response();
+
+        assert_eq!(l.unfinished(), 1, "B is still running: {}", l.line());
+        assert_eq!(
+            l.outcomes(),
+            vec![(Outcome::Timeout, 1)],
+            "only A ended, and it ended in a timeout: {}",
+            l.line()
+        );
+        assert_eq!(l.owed(), 1, "one answer is still owed: {}", l.line());
+        assert_eq!(
+            l.ambiguous(),
+            1,
+            "and one arrived that could not be attributed: {}",
+            l.line()
+        );
+        assert!(
+            l.line().contains("owed 1 ambiguous 1"),
+            "the line must say the pairing is no longer trustworthy: {}",
+            l.line()
+        );
+        assert_eq!(
+            l.received(),
+            1,
+            "the answer still arrived, and is still counted: {}",
+            l.line()
+        );
+    }
+
+    /// Under a CONCURRENT batch, "the last request sent" is not the one that
+    /// timed out — which is why the label travels with the operation.
+    ///
+    /// Four puts go out before any answer comes back. The first times out.
+    /// A ledger that closed "the last one" would end the FOURTH, leaving the
+    /// first open for ever and reporting a failure against an operation that
+    /// was doing nothing wrong.
+    #[test]
+    fn under_a_concurrent_batch_the_last_request_is_not_the_one_that_failed() {
+        let l = Ledger::new();
+        let ids: Vec<_> = (0..4).map(|_| l.request("put")).collect();
+        let (first, last) = (ids[0], ids[3]);
+        assert_ne!(first, last, "the batch really is concurrent");
+
+        l.finish(first, Outcome::Timeout);
+
+        let open = l.outstanding();
+        assert!(
+            !open.contains(&first),
+            "the operation that timed out is no longer open: {}",
+            l.line()
+        );
+        assert!(
+            open.contains(&last),
+            "and the LAST one sent is untouched — it never failed: {}",
+            l.line()
+        );
+        assert_eq!(open.len(), 3);
+
+        // Three answers now arrive. Each of them MIGHT be the first put's, so
+        // none of them may close anything: the honest report is that three
+        // answers came back and the pairing cannot be trusted.
+        for _ in 0..3 {
+            l.response();
+        }
+        assert_eq!(l.ambiguous(), 3, "{}", l.line());
+        assert_eq!(
+            l.outcomes(),
+            vec![(Outcome::Timeout, 1)],
+            "no operation was closed on a guess: {}",
+            l.line()
+        );
+        assert_eq!(l.unfinished(), 3, "{}", l.line());
+    }
+
+    /// A caller that can name its own answer closes its OWN operation, and
+    /// that keeps working after the pairing has been lost.
+    ///
+    /// This is the other half of the fix: `Awaiting` matches a `PutResponse`
+    /// by key, so the put path never has to ask the ledger to guess.
+    #[test]
+    fn a_caller_that_identifies_its_answer_closes_its_own_operation() {
+        let l = Ledger::new();
+        let a = l.request("put");
+        l.finish(a, Outcome::Timeout);
+        let b = l.request("put");
+        // The caller matched this answer to B by key, so it says so itself.
+        l.finish(b, Outcome::Ok);
+        assert_eq!(l.unfinished(), 0, "both operations ended: {}", l.line());
+        let mut got = l.outcomes();
+        got.sort_by_key(|(o, _)| format!("{o:?}"));
+        assert_eq!(got, vec![(Outcome::Ok, 1), (Outcome::Timeout, 1)]);
+        assert_eq!(
+            l.ambiguous(),
+            0,
+            "identifying the answer means nothing was guessed: {}",
+            l.line()
         );
     }
 

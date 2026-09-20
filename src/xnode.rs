@@ -584,7 +584,7 @@ pub async fn write(
             let key = contract.key();
             let t_send = now_ns();
             let t = std::time::Instant::now();
-            send_req(
+            let sent = send_req(
                 &mut client,
                 ClientRequest::ContractOp(ContractRequest::Put {
                     contract,
@@ -596,15 +596,58 @@ pub async fn write(
                 wait,
             )
             .await?;
-            let ack = match timeout(wait, client.recv()).await {
-                Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse {
-                    key: k,
-                }))) if k == key => format!("{:.1}", ms_since(t)),
-                other => {
-                    println!("# put failed for {}: {other:?}", key.id());
-                    continue;
+            // Matched BY KEY, because a `PutResponse` carries one.
+            //
+            // The version this replaces read exactly one response per put and
+            // compared it with `if k == key`, printing "put failed" and moving
+            // on when it did not match. Three early puts timed out; their
+            // acknowledgements arrived afterwards; nobody consumed them; and
+            // from the sixth put onward every read returned the PREVIOUS put's
+            // answer. The run reported 0 of 20 puts succeeded against a node
+            // that had accepted 15, and three of its lines carried the node's
+            // own timeout text, so the output read as a verdict about the node
+            // (harness#38).
+            //
+            // `Awaiting` is the implementation this crate already has for "is
+            // this the answer I asked for", with its own tests. The reason
+            // this loop was wrong is that it did not use it.
+            let deadline = std::time::Instant::now() + wait;
+            let mut waiting = crate::latency::Awaiting::new(key);
+            let ack = loop {
+                let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) else {
+                    // Nothing came back for THIS key. The node may still owe
+                    // the answer, and the ledger has to know that before the
+                    // next put reads a response that might be this one's.
+                    client.finish(sent, instrument::vocab::Outcome::Timeout);
+                    println!(
+                        "# put not acknowledged within {:.0} s for {}: {}",
+                        wait.as_secs_f64(),
+                        key.id(),
+                        client.line()
+                    );
+                    break None;
+                };
+                let arrived = match timeout(left, client.recv()).await {
+                    Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse {
+                        key: k,
+                    }))) => Some(k),
+                    Ok(Ok(_)) => None,
+                    Ok(Err(e)) => {
+                        client.finish(sent, instrument::vocab::Outcome::Blocked);
+                        println!("# put failed for {}: {e}", key.id());
+                        break None;
+                    }
+                    Err(_) => continue,
+                };
+                if waiting.offer(arrived.as_ref()) {
+                    // This caller identified its own answer, so it closes its
+                    // own operation by id — the only honest way once an answer
+                    // may already be owed to another.
+                    client.finish(sent, instrument::vocab::Outcome::Ok);
+                    break Some(format!("{:.1}", ms_since(t)));
                 }
             };
+            let Some(ack) = ack else { continue };
             // One line per block: key, absolute send time, ack ms, state size.
             println!("PUT {} {} {} {}", key.id(), t_send, ack, state.len());
         }
@@ -865,7 +908,7 @@ async fn probe_once(
     if queued_hit.is_some() {
         return Ok(queued_hit);
     }
-    send_req(
+    let sent = send_req(
         client,
         ClientRequest::ContractOp(ContractRequest::Get {
             key: *id,
@@ -876,6 +919,10 @@ async fn probe_once(
         Duration::from_secs(30),
     )
     .await?;
+    // This probe knows which key it asked for, so it closes ITS OWN operation
+    // by id. That is the only honest way to end a specific operation on a
+    // connection where an answer may already be owed to another.
+
     // Keyed, and it has to be. The drain above matches by key; this branch did
     // not, so ANY GetResponse satisfied ANY probe and one key's answer was
     // credited to another key's wait. With one probe per key that is not a
@@ -911,10 +958,13 @@ async fn probe_once(
             // A probe that came back with nothing is a MISS, not a failure and
             // not an open request: the node answered, and the answer was "I do
             // not have it".
-            client.finish_last(match len {
-                Some(_) => instrument::vocab::Outcome::Ok,
-                None => instrument::vocab::Outcome::Missing,
-            });
+            client.finish(
+                sent,
+                match len {
+                    Some(_) => instrument::vocab::Outcome::Ok,
+                    None => instrument::vocab::Outcome::Missing,
+                },
+            );
             return Ok(len);
         }
     }

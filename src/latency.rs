@@ -325,7 +325,7 @@ pub(crate) async fn send_req(
     client: &mut crate::probe::Client,
     req: ClientRequest<'static>,
     wait: Duration,
-) -> Result<()> {
+) -> Result<instrument::Label> {
     send_req_ctx(client, req, wait, "").await
 }
 
@@ -346,14 +346,23 @@ pub(crate) async fn send_req_ctx(
     req: ClientRequest<'static>,
     wait: Duration,
     what: &str,
-) -> Result<()> {
-    match timeout(wait, client.send(req)).await {
-        Ok(r) => r,
+) -> Result<instrument::Label> {
+    // The label has to be taken BEFORE the await: this is the one caller whose
+    // await may never return, and it still has to name the operation it is
+    // ending. `finish_last` cannot do that honestly — "the last request sent"
+    // is not the one that timed out as soon as more than one is in flight.
+    let sent = client.send(req);
+    let id = sent.id;
+    // Bound to a local so the send's borrow of `client` has ended by the time
+    // the arms run; a match on the timeout directly would hold it across them.
+    let settled = timeout(wait, sent).await;
+    match settled {
+        Ok(r) => r.map(|()| id),
         Err(_) => {
             // The operation ENDED, and it ended in a timeout. Without this the
             // dump would show an edge nobody answered, which is the same shape
             // a slow node makes — and the two want different responses.
-            client.finish_last(instrument::vocab::Outcome::Timeout);
+            client.finish(id, instrument::vocab::Outcome::Timeout);
             // The message is now a PROJECTION of the recording rather than a
             // sentence someone wrote about it. "What the caller had not
             // drained" used to be a string each call site passed in by hand,
