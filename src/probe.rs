@@ -175,6 +175,39 @@ impl Ledger {
         id
     }
 
+    /// Bytes this operation handed to the client API.
+    pub fn offered(&self, id: Label, n: u64) {
+        if n > 0 {
+            self.rec.event(Event::Counter {
+                site: SEND,
+                op: id.op(),
+                entry: Entry {
+                    key: Key::BytesOut,
+                    value: n,
+                },
+            });
+        }
+    }
+
+    /// Bytes an answer carried back for this operation.
+    ///
+    /// Named `received_bytes`, not `received`: this ledger already has a
+    /// `received()` that counts ANSWERS. Two methods a letter apart, one
+    /// counting messages and one counting bytes, is a footgun in a file whose
+    /// whole subject is numbers that must not be confused for each other.
+    pub fn received_bytes(&self, id: Label, n: u64) {
+        if n > 0 {
+            self.rec.event(Event::Counter {
+                site: RECV,
+                op: id.op(),
+                entry: Entry {
+                    key: Key::BytesIn,
+                    value: n,
+                },
+            });
+        }
+    }
+
     /// Record an answer that NAMED itself.
     ///
     /// This is the whole point of the keyed path: the answer closes the
@@ -362,6 +395,14 @@ impl Ledger {
     pub fn ambiguous(&self) -> u64 {
         self.rec.recording().total(Key::Ambiguous)
     }
+    /// The recording, for TESTS to read back. Not on the probe path: the trait
+    /// instrumented code holds has no read-back, so a probe can never become
+    /// an input.
+    #[cfg(test)]
+    pub fn recording_for_test(&self) -> instrument::SyncRecording<'_> {
+        self.rec.recording()
+    }
+
     pub fn dump(&self, what: &'static str) -> String {
         render(&self.rec.recording(), what, 40)
     }
@@ -453,6 +494,7 @@ impl Client {
     /// unchanged; the two that refine an outcome bind it first and keep `id`.
     pub fn send(&mut self, req: ClientRequest<'static>) -> Sent<'_> {
         let id = self.ledger.request(describe(&req));
+        self.ledger.offered(id, offered_bytes(&req));
         Sent {
             id,
             fut: Box::pin(async move { self.inner.send(req).await.map_err(Into::into) }),
@@ -461,7 +503,20 @@ impl Client {
 
     pub async fn recv(&mut self) -> Result<HostResponse, anyhow::Error> {
         let got = self.inner.recv().await;
-        self.ledger.response();
+        match &got {
+            // An answer that NAMES itself is paired here, at the boundary,
+            // rather than at each call site that remembers to. That is the
+            // whole argument for boundary middleware: the call sites which
+            // forgot are what harness#38 and harness#39 run 1 were.
+            Ok(r) => match names_key(r) {
+                Some(k) => {
+                    let id = self.ledger.answered(&k);
+                    self.ledger.received_bytes(id, received_bytes(r));
+                }
+                None => self.ledger.response(),
+            },
+            Err(_) => self.ledger.response(),
+        }
         got.map_err(Into::into)
     }
 
@@ -484,16 +539,18 @@ impl Client {
     /// which operation an answer ended.
     pub fn send_keyed(&mut self, req: ClientRequest<'static>, key: &str) -> Sent<'_> {
         let id = self.ledger.request_keyed(describe(&req), key);
+        self.ledger.offered(id, offered_bytes(&req));
         Sent {
             id,
             fut: Box::pin(async move { self.inner.send(req).await.map_err(Into::into) }),
         }
     }
 
-    /// Record an answer that named itself.
-    pub fn answered(&self, key: &str) {
-        self.ledger.answered(key);
-    }
+    // `answered` is deliberately NOT exposed on the client. `recv` pairs a
+    // self-naming answer at the boundary, so a call site cannot forget to —
+    // and a call site that called it anyway would record the same answer twice.
+    // Removing the public path is the enforcement; a comment asking people to
+    // remember is not.
 
     /// What happened to every keyed operation. ONE projection — a tool that
     /// keeps its own per-key map keeps a second account that can disagree.
@@ -537,6 +594,73 @@ impl core::future::Future for Sent<'_> {
         cx: &mut core::task::Context<'_>,
     ) -> core::task::Poll<Self::Output> {
         self.fut.as_mut().poll(cx)
+    }
+}
+
+/// The payload bytes this operation hands to the client API.
+///
+/// **Named for what it is.** It is not bytes on the socket: the wire framing
+/// and its encoding happen inside `WebApi`, and re-encoding a request purely to
+/// measure it would double the cost of every send to learn a number a few
+/// percent different. It is the contract code, parameters, state and delta —
+/// the parts the caller supplies, which dominate, and which are known exactly
+/// and for free.
+///
+/// The one thing it must never be mistaken for is what a NODE sends
+/// peer-to-peer. Six external instruments were rejected trying to infer that
+/// from outside (freenet-contracts#39); only the node can count it.
+fn offered_bytes(req: &ClientRequest<'static>) -> u64 {
+    use freenet_stdlib::client_api::ContractRequest;
+    let container = |c: &freenet_stdlib::prelude::ContractContainer| -> u64 {
+        match c {
+            freenet_stdlib::prelude::ContractContainer::Wasm(
+                freenet_stdlib::prelude::ContractWasmAPIVersion::V1(w),
+            ) => w.code().data().len() as u64 + w.params().as_ref().len() as u64,
+            _ => 0,
+        }
+    };
+    match req {
+        ClientRequest::ContractOp(ContractRequest::Put {
+            contract,
+            state,
+            related_contracts,
+            ..
+        }) => {
+            let _ = related_contracts;
+            container(contract) + state.as_ref().len() as u64
+        }
+        ClientRequest::ContractOp(ContractRequest::Update { data, .. }) => match data {
+            freenet_stdlib::prelude::UpdateData::State(s) => s.as_ref().len() as u64,
+            freenet_stdlib::prelude::UpdateData::Delta(d) => d.as_ref().len() as u64,
+            _ => 0,
+        },
+        _ => 0,
+    }
+}
+
+/// The payload bytes an answer carried back.
+fn received_bytes(r: &HostResponse) -> u64 {
+    use freenet_stdlib::client_api::ContractResponse;
+    match r {
+        HostResponse::ContractResponse(ContractResponse::GetResponse { state, .. }) => {
+            state.as_ref().len() as u64
+        }
+        _ => 0,
+    }
+}
+
+/// The contract key an answer NAMES, when it names one.
+///
+/// This is what makes the transport able to pair without the call site
+/// remembering to: a `PutResponse` and a `GetResponse` both carry their key.
+fn names_key(r: &HostResponse) -> Option<String> {
+    use freenet_stdlib::client_api::ContractResponse;
+    match r {
+        HostResponse::ContractResponse(ContractResponse::PutResponse { key })
+        | HostResponse::ContractResponse(ContractResponse::GetResponse { key, .. }) => {
+            Some(key.id().to_string())
+        }
+        _ => None,
     }
 }
 
@@ -900,6 +1024,87 @@ mod tests {
             "identifying the answer means nothing was guessed: {}",
             l.line()
         );
+    }
+
+    /// Bytes are attributed to the operation that offered them, and a WRONG
+    /// count fails rather than being a plausible number nobody checks.
+    ///
+    /// A byte counter is the easiest kind of instrument to get quietly wrong,
+    /// because any number it prints looks like a measurement. So the test
+    /// asserts the EXACT total against what was handed in, not that it is
+    /// "about right".
+    #[test]
+    fn bytes_are_attributed_to_the_operation_that_offered_them() {
+        let l = Ledger::new();
+        let a = l.request("put");
+        l.offered(a, 101_641 + 32);
+        let b = l.request("put");
+        l.offered(b, 101_641 + 32);
+        l.received_bytes(a, 1_025);
+
+        let rec = l.recording_for_test();
+        assert_eq!(
+            rec.bytes(a.op()),
+            (101_673, 1_025),
+            "operation a's own bytes, not the connection's total"
+        );
+        assert_eq!(
+            rec.bytes(b.op()),
+            (101_673, 0),
+            "b offered the same and received nothing"
+        );
+        assert_eq!(
+            rec.total(Key::BytesOut),
+            203_346,
+            "and the whole-recording total is the sum of both"
+        );
+    }
+
+    /// `offered_bytes` counts what it says it counts.
+    ///
+    /// The previous test exercised the LEDGER with a number handed to it, which
+    /// left the function that computes that number — the part that can actually
+    /// be wrong — untested. A byte counter nobody checks is a plausible-looking
+    /// number, which is worse than none.
+    #[test]
+    fn offered_bytes_counts_the_contract_and_the_state_exactly() {
+        use freenet_stdlib::client_api::ContractRequest;
+        use freenet_stdlib::prelude::*;
+
+        let code = ContractCode::from(vec![7u8; 101_641]);
+        let params = Parameters::from(vec![0u8; 32]);
+        let state = vec![9u8; 1_024];
+        let contract = ContractContainer::Wasm(ContractWasmAPIVersion::V1(WrappedContract::new(
+            std::sync::Arc::new(code),
+            params,
+        )));
+        let req = ClientRequest::ContractOp(ContractRequest::Put {
+            contract,
+            state: WrappedState::from(state),
+            related_contracts: RelatedContracts::default(),
+            subscribe: false,
+            blocking_subscribe: false,
+        });
+
+        assert_eq!(
+            super::offered_bytes(&req),
+            101_641 + 32 + 1_024,
+            "code + parameters + state, exactly — this is the number every \
+             per-operation byte figure is built from"
+        );
+
+        // A request that carries no payload of ours must count zero rather than
+        // some incidental size, or every GET would inflate the total.
+        let get = ClientRequest::ContractOp(ContractRequest::Get {
+            key: ContractInstanceId::try_from(
+                "9nPgCTfiuX3Zycngp3vvgFiY9aqUmvKG64y86t6qgyKi".to_string(),
+            )
+            .unwrap(),
+            return_contract_code: false,
+            subscribe: false,
+            blocking_subscribe: false,
+        });
+        assert_eq!(super::offered_bytes(&get), 0);
     }
 
     /// What recording costs, measured against the grid it has to stay inside.
