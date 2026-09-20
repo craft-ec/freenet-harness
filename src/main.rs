@@ -1,6 +1,7 @@
 //! Drives a real Freenet node: round-trips Blocks, measures put/get latency,
 //! probes delegate capabilities.
 
+mod bag;
 mod latency;
 mod stats;
 mod validate_cost;
@@ -126,6 +127,15 @@ enum Cmd {
         /// the same contract; random when omitted.
         #[arg(long)]
         salt: Option<String>,
+    },
+    /// Bag contract live-node round trip (#7). Runs in --local.
+    Bag {
+        #[arg(long, default_value = "../freenet-contracts/build/bag.wasm")]
+        wasm: String,
+        #[arg(long, default_value_t = 8)]
+        work_bits: u8,
+        #[arg(long, default_value_t = 8)]
+        m: u16,
     },
     /// Cross-node: write blocks on one node, then measure on ANOTHER how
     /// long until each is readable there.
@@ -562,6 +572,9 @@ async fn main() -> Result<()> {
                 wait,
             )
             .await?;
+        }
+        Cmd::Bag { wasm, work_bits, m } => {
+            bag::run(&ws, &wasm, work_bits, m, wait).await?;
         }
         Cmd::Watch { key, secs } => {
             watch::run(&ws, &key, secs, wait).await?;

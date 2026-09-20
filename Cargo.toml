@@ -8,6 +8,9 @@ description = "Drives a real Freenet node: deploys contracts, round-trips state,
 
 [dependencies]
 craftec-block-contract = { path = "../freenet-contracts/block", default-features = false }
+# The Bag's own wire code and mining helpers: the harness must not have a
+# second opinion about the format it is testing.
+craftec-bag-contract = { path = "../freenet-contracts/bag", default-features = false, features = ["testing"] }
 freenet-stdlib = { version = "0.10.0", features = ["net"] }
 blake3 = "1"
 tokio = { version = "1", features = ["full"] }
