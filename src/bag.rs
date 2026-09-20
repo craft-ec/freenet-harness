@@ -102,7 +102,7 @@ pub async fn run(
     wasm: &str,
     work_bits: u8,
     m: u16,
-    expect_sha: Option<&str>,
+    expect_sha: &str,
     wait: Duration,
 ) -> Result<()> {
     // Says what it tested, and refuses the wrong artefact outright.
