@@ -30,4 +30,4 @@ getrandom = { version = "0.2", features = ["std"] }
 # The harness is a test tool and records generously. A NORMAL dependency here,
 # unlike in prolly and the contracts: nothing in this repository is compiled
 # into a contract's wasm, so there is no closure to keep it out of.
-instrument = { git = "https://github.com/craft-ec/craftworks-instrument", rev = "d765891" }
+instrument = { git = "https://github.com/craft-ec/craftworks-instrument", rev = "bae2823" }

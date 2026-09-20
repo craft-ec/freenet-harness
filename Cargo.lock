@@ -818,7 +818,7 @@ dependencies = [
 [[package]]
 name = "instrument"
 version = "0.1.0"
-source = "git+https://github.com/craft-ec/craftworks-instrument?rev=d765891#d7658911983b6b3800cab6631ea0fa0773b95ef8"
+source = "git+https://github.com/craft-ec/craftworks-instrument?rev=bae2823#bae28232c47449b76af5b32245a5a939ed7f8331"
 
 [[package]]
 name = "is_terminal_polyfill"
