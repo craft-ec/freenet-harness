@@ -38,7 +38,7 @@ use freenet_stdlib::{
 use tokio::time::timeout;
 
 use crate::{
-    latency::{ms_since, progress_pub, send_req, send_req_ctx},
+    latency::{ms_since, progress_pub, send_req},
     stats::{kib, Grid, Summary, Table},
 };
 
@@ -170,6 +170,7 @@ pub async fn put_minted(
     wasm: &str,
     minted: &str,
     hedge: Option<Duration>,
+    until_conditioned: usize,
     wait: Duration,
 ) -> Result<()> {
     let code = Arc::new(ContractCode::from(std::fs::read(wasm)?));
@@ -385,12 +386,50 @@ pub async fn put_minted(
         if last_beat.elapsed() >= Duration::from_secs(30) {
             last_beat = std::time::Instant::now();
             progress_pub(format_args!(
-                "  {} sent, {} acked, {} readable here, {} hedged",
+                "  {} sent, {} acked, {} readable here, {} hedged, conditioned {}c/{}h \
+                 of {until_conditioned}",
                 trials.len(),
                 trials.iter().filter(|t| t.ack_ms.is_some()).count(),
                 trials.iter().filter(|t| t.confirm_ms.is_some()).count(),
-                trials.iter().filter(|t| t.hedged).count()
+                trials.iter().filter(|t| t.hedged).count(),
+                trials
+                    .iter()
+                    .filter(|t| t.arm == Arm::Control && t.unacked_at_t == Some(true))
+                    .count(),
+                trials
+                    .iter()
+                    .filter(|t| t.arm == Arm::Hedge && t.unacked_at_t == Some(true))
+                    .count()
             ));
+        }
+
+        // The MILESTONE, not the clock.
+        //
+        // What this run needs is a conditioned population — trials still
+        // unacknowledged at T, in BOTH arms — because that is the only
+        // comparison worth printing. So it stops when it HAS that, and `wait`
+        // is a backstop set far beyond rather than the thing being waited on.
+        // A duration ends a healthy run early and lets a barren one burn the
+        // whole budget.
+        let conditioned = |arm: Arm| {
+            trials
+                .iter()
+                .filter(|t| t.arm == arm && t.unacked_at_t == Some(true))
+                .count()
+        };
+        if until_conditioned > 0
+            && conditioned(Arm::Control) >= until_conditioned
+            && conditioned(Arm::Hedge) >= until_conditioned
+        {
+            progress_pub(format_args!(
+                "  milestone: {until_conditioned} conditioned in each arm ({} control, {} \
+                 hedge) after {} of {} trials — stopping, the comparison has what it needs",
+                conditioned(Arm::Control),
+                conditioned(Arm::Hedge),
+                trials.len(),
+                plan.len()
+            ));
+            break;
         }
 
         let done = to_send == plan.len()
@@ -531,7 +570,20 @@ pub async fn read(
     // every key is re-probed on the same cadence.
     let mut pending: Vec<(String, ContractInstanceId, u128, String)> = Vec::new();
     let mut warm_at_start = 0usize;
+    // The control pass had no deadline at all: 240 bounded probes is a minute
+    // on a good day and unbounded on a bad one, before the run's own limit had
+    // been consulted once.
+    let started = std::time::Instant::now();
+    let deadline = started + Duration::from_secs(limit_secs);
     for line in text.lines() {
+        if std::time::Instant::now() >= deadline {
+            bail!(
+                "the {limit_secs} s limit ran out during the COLD CONTROL, with {} of the keys \
+                 checked. No key was proved cold, so nothing this run could measure would mean \
+                 anything.",
+                pending.len() + warm_at_start
+            );
+        }
         let f: Vec<&str> = line.split_whitespace().collect();
         // Accept both shapes: PUT lines carry the send time, MINT lines do
         // not exist yet on the network at all (t_send filled in later by the
@@ -583,62 +635,74 @@ pub async fn read(
     // key's first-readable time is resolved to a full cycle, not to one probe
     // period.
     let mut first_reads = Vec::new();
-    let deadline = std::time::Instant::now() + Duration::from_secs(limit_secs);
     let rounds_per_cycle = pending.len().div_ceil(BURST).max(1);
-    let cycle_ms = rounds_per_cycle as u64 * probe_ms;
     println!(
-        "# probe grid: {BURST} keys per round, {probe_ms} ms per round, {rounds_per_cycle} \
-         round(s) per cycle — a first-readable time is resolved to {cycle_ms} ms, not {probe_ms} ms"
+        "# probe grid: one probe at a time, up to {} ms each, {BURST} keys per round, \
+         {rounds_per_cycle} round(s) per cycle — a first-readable time is resolved to about \
+         {} ms, which is what a key waits between two looks at it",
+        PROBE_ONE.as_millis(),
+        rounds_per_cycle as u128 * BURST as u128 * PROBE_ONE.as_millis()
     );
     let mut cursor = 0usize;
-    let mut outstanding = 0usize;
-    let mut reconnects = 0usize;
+    let mut rounds = 0usize;
+    let mut sends = 0usize;
+    // A heartbeat, because in the case this loop is hardest on — every key
+    // cold, so no READ line will ever be printed — it otherwise produces NO
+    // output at all. A wedged reader and a working one then look identical
+    // from outside, which is exactly what happened: 65 minutes of nothing,
+    // indistinguishable from 65 minutes of work. Progress has to be visible
+    // before anything can watch for it.
+    let mut last_beat = std::time::Instant::now();
     while !pending.is_empty() && std::time::Instant::now() < deadline {
-        if outstanding >= OUTSTANDING_CAP {
-            let _ = client.send(ClientRequest::Disconnect { cause: None }).await;
-            client = crate::connect(ws).await?;
-            outstanding = 0;
-            reconnects += 1;
-        }
+        // ONE probe at a time, send then read — the only pattern with any
+        // evidence behind it.
+        //
+        // The batched form (send N, then drain) blocked its send at probe 3 of
+        // a round, then 13, then 8, then 27, then 14. Batching was tried three
+        // ways — a cap on outstanding requests, a cancel-and-reconnect, a fresh
+        // socket per round — and every one of them still died, at 1,900 then
+        // 2,432 then 7,904 probes. Those looked like a progression and are not:
+        // the same binary later died in its FIRST round, so the failure is
+        // non-deterministic and single runs of it measure nothing. The
+        // difference between those numbers was noise I read as a slope.
+        //
+        // What has never failed is this: the cold control pass above sends one
+        // probe, waits for its answer, and walks all 240 keys — in every run
+        // today, including the ones that died seconds later in the batched
+        // loop. So the rounds use the control pass's own call.
+        //
+        // It costs a bounded wait per key rather than per round, so the cycle
+        // is `keys x PROBE_ONE` and the run PRINTS that. A first-readable time
+        // is resolved to a cycle. This is slower than the batched form was
+        // supposed to be, and it is the form that finishes.
+        let mut seen: Vec<ContractInstanceId> = Vec::new();
         let n = BURST.min(pending.len());
         for step in 0..n {
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
             let (_, id, _, _) = &pending[(cursor + step) % pending.len()];
-            send_req_ctx(
-                &mut client,
-                ClientRequest::ContractOp(ContractRequest::Get {
-                    key: *id,
-                    return_contract_code: return_code,
-                    subscribe: false,
-                    blocking_subscribe: false,
-                }),
-                Duration::from_secs(30),
-                &format!(
-                    "probe {} of {n} this round, {} key(s) still cold — a GET for a key no \
-                     node holds is never answered, so these do not drain",
-                    step + 1,
-                    pending.len()
-                ),
-            )
-            .await?;
-            outstanding += 1;
+            if probe_once(&mut client, id, return_code, PROBE_ONE)
+                .await?
+                .is_some()
+            {
+                seen.push(*id);
+            }
         }
         cursor = (cursor + n) % pending.len();
-        // Drain for one probe period, crediting every answer that names a
-        // pending key.
-        let round_end = std::time::Instant::now() + Duration::from_millis(probe_ms);
-        let mut seen: Vec<ContractInstanceId> = Vec::new();
-        while let Some(left) = round_end.checked_duration_since(std::time::Instant::now()) {
-            match timeout(left, client.recv()).await {
-                Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
-                    key: k,
-                    ..
-                }))) => {
-                    outstanding = outstanding.saturating_sub(1);
-                    seen.push(*k.id())
-                }
-                Ok(Ok(_)) | Ok(Err(_)) => {}
-                Err(_) => break,
-            }
+        rounds += 1;
+        sends += n;
+        if last_beat.elapsed() >= Duration::from_secs(5) {
+            last_beat = std::time::Instant::now();
+            println!(
+                "# alive: round {rounds}, {sends} probes sent, {} read, {} still cold, \
+                 {:.0} s of {limit_secs}",
+                first_reads.len(),
+                pending.len(),
+                started.elapsed().as_secs_f64()
+            );
+            use std::io::Write as _;
+            let _ = std::io::stdout().flush();
         }
         let hit_at = now_ns();
         let mut still = Vec::with_capacity(pending.len());
@@ -653,14 +717,20 @@ pub async fn read(
         }
         pending = still;
     }
+    let ran_out = std::time::Instant::now() >= deadline;
     for (id_s, _, _, size) in &pending {
         println!("MISS {id_s} {size} not readable within {limit_secs} s");
     }
-    let _ = client.send(ClientRequest::Disconnect { cause: None }).await;
     println!(
-        "# reconnects: {reconnects} (one per {OUTSTANDING_CAP} unanswered probes — a probe for \
-         a key no node holds is never collected by anything)"
+        "# stopped after {:.0} s because {}",
+        started.elapsed().as_secs_f64(),
+        if ran_out {
+            "the run reached its limit — the MISSes above are 'not within the limit', NOT 'never'"
+        } else {
+            "every key had been read"
+        }
     );
+    let _ = client.send(ClientRequest::Disconnect { cause: None }).await;
     println!(
         "# cold-confirmed={cold_confirmed} void(warm at start)={warm_at_start} \
          read={} missed={}",
@@ -682,23 +752,13 @@ pub async fn read(
 /// This bounds a burst. It does NOT bound the leak — see [`OUTSTANDING_CAP`].
 const BURST: usize = 32;
 
-/// How many unanswered probes may accumulate before the connection is
-/// discarded and re-opened.
+/// How long one probe waits for its answer.
 ///
-/// A GET for a key no node holds is never answered. Not "answered slowly":
-/// never. So every round leaks up to `BURST` requests that nothing will ever
-/// collect, and no PER-ROUND bound can hold the total down — which is why the
-/// per-round bound was not enough. Measured: a run probing 222 cold keys
-/// leaked about 1,900 requests in twelve seconds and the socket backpressured,
-/// killing the second run in a row.
-///
-/// The only way to bound a set nothing removes from is to discard it. A
-/// reconnect costs a websocket handshake and loses nothing that carried
-/// information: an unanswered probe has no answer to lose. What it CAN lose is
-/// an answer in flight at that instant — that key stays pending and is found
-/// one cycle later, which is a resolution cost the run reports, not a
-/// correctness one.
-const OUTSTANDING_CAP: usize = 256;
+/// Short: a node that holds the block answers from its own store in a
+/// millisecond or two, and a node that does not hold it will not answer at
+/// all. Waiting longer buys nothing and costs every other key its place in the
+/// cycle.
+const PROBE_ONE: Duration = Duration::from_millis(20);
 
 /// One bounded GET. `Some(len)` when this node served the state.
 /// `bound` is how long to wait for the ANSWER, not for the send.
@@ -1236,6 +1296,10 @@ pub struct ReadOpts {
     /// assumed: the `clock` role prints each machine's stamp, and the run that
     /// produced these files reports what it could bound them to.
     pub clock_margin_ms: f64,
+    /// Stop the put role once BOTH arms hold this many trials that were still
+    /// unacknowledged at T — the population the comparison is made over. The
+    /// milestone, not a clock; 0 means run the whole plan.
+    pub until_conditioned: usize,
     /// The READER's probe grid, in ms, which it printed at the top of its own
     /// output: `rounds_per_cycle * probe_ms`. A far-node time is resolved to
     /// this, not to the probe period, and a series whose whole spread fits
@@ -1266,6 +1330,7 @@ pub async fn run(
                 wasm,
                 &opts.keys,
                 (opts.hedge_secs > 0.0).then(|| Duration::from_secs_f64(opts.hedge_secs)),
+                opts.until_conditioned,
                 wait,
             )
             .await

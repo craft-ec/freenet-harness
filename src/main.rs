@@ -380,6 +380,15 @@ enum Cmd {
         /// one step — that series measured the instrument.
         #[arg(long, default_value_t = 0.0)]
         grid_ms: f64,
+        /// Stop the `put` role once BOTH arms hold this many trials that were
+        /// still unacknowledged at T.
+        ///
+        /// That population IS the measurement — a whole-arm comparison is
+        /// diluted by the trials a hedge never touches — so the run stops when
+        /// it has enough of it rather than when a clock expires. Leave
+        /// `--timeout-secs` as a backstop far beyond it. 0 runs the whole plan.
+        #[arg(long, default_value_t = 0)]
+        until_conditioned: usize,
         #[arg(long, default_value_t = 20)]
         samples: usize,
         #[arg(long, value_delimiter = ',', default_values_t = [1024, 16384, 262144])]
@@ -405,10 +414,24 @@ enum Cmd {
     },
 }
 
+/// How long opening a connection may take before it is a failure.
+///
+/// `connect_async` has no timeout of its own, so every caller in this harness
+/// could hang here forever — and one did: a reader that reconnected to recover
+/// from a blocked send sat inside this call for 65 minutes, having been given
+/// a 180 s run limit, because the limit is checked between operations and this
+/// operation never returned. An unbounded await inside a recovery path is the
+/// recovery becoming the stall.
+const CONNECT: Duration = Duration::from_secs(15);
+
 pub(crate) async fn connect(ws: &str) -> Result<WebApi> {
-    let (stream, _) = tokio_tungstenite::connect_async(ws)
-        .await
-        .map_err(|e| anyhow!("cannot reach the node at {ws}: {e}"))?;
+    let (stream, _) = match timeout(CONNECT, tokio_tungstenite::connect_async(ws)).await {
+        Ok(r) => r.map_err(|e| anyhow!("cannot reach the node at {ws}: {e}"))?,
+        Err(_) => bail!(
+            "cannot reach the node at {ws}: the connection did not open within {} s",
+            CONNECT.as_secs()
+        ),
+    };
     Ok(WebApi::start(stream))
 }
 
@@ -788,6 +811,7 @@ async fn main() -> Result<()> {
             hedge_secs,
             clock_margin_ms,
             grid_ms,
+            until_conditioned,
             samples,
             sizes,
             return_code,
@@ -806,6 +830,7 @@ async fn main() -> Result<()> {
                     hedge_secs,
                     clock_margin_ms,
                     grid_ms,
+                    until_conditioned,
                     return_code,
                     probe_ms,
                     limit_secs,
