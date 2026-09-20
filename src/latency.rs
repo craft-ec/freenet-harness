@@ -188,18 +188,29 @@ pub(crate) async fn put_container(
     state: &[u8],
     wait: Duration,
 ) -> Result<()> {
-    match timed_put(client, contract, state, wait).await? {
+    let mut stale = 0usize;
+    match timed_put(client, contract, state, wait, &mut stale).await? {
         Sample::Ms(_) => Ok(()),
         Sample::Failed(e) => bail!("seed put failed: {e}"),
     }
 }
 
 /// Put one contract and time the acknowledgement.
+///
+/// The answer is matched BY KEY, and answers to earlier requests are discarded
+/// rather than counted against this one. One connection carries every request
+/// in a series, so a put that timed out at 90 s and was given up on can still
+/// have its acknowledgement arrive while a LATER put is being timed — and the
+/// earlier version of this function reported that as "unexpected response" and
+/// threw away the later put's sample. On a hotspot, where the first put took
+/// 61 s, that lost 5 of 30 samples and every one of them was a slow one, which
+/// biases a percentile in the flattering direction.
 async fn timed_put(
     client: &mut WebApi,
     contract: ContractContainer,
     state: &[u8],
     wait: Duration,
+    stale: &mut usize,
 ) -> Result<Sample> {
     let key = contract.key();
     let t = Instant::now();
@@ -215,16 +226,33 @@ async fn timed_put(
         wait,
     )
     .await?;
-    Ok(match timeout(wait, client.recv()).await {
-        Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key: k })))
-            if k == key =>
-        {
-            Sample::Ms(ms_since(t))
+    let deadline = t + wait;
+    loop {
+        let Some(left) = deadline.checked_duration_since(Instant::now()) else {
+            return Ok(Sample::Failed(format!(
+                "no response within {} s",
+                wait.as_secs()
+            )));
+        };
+        match timeout(left, client.recv()).await {
+            Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key: k }))) => {
+                if k == key {
+                    return Ok(Sample::Ms(ms_since(t)));
+                }
+                // Somebody else's answer, arriving late. Not this sample's
+                // latency and not this sample's error.
+                *stale += 1;
+            }
+            Ok(Ok(_other)) => *stale += 1,
+            Ok(Err(e)) => return Ok(Sample::Failed(format!("node error: {e}"))),
+            Err(_) => {
+                return Ok(Sample::Failed(format!(
+                    "no response within {} s",
+                    wait.as_secs()
+                )))
+            }
         }
-        Ok(Ok(other)) => Sample::Failed(format!("unexpected response: {other:?}")),
-        Ok(Err(e)) => Sample::Failed(format!("node error: {e}")),
-        Err(_) => Sample::Failed(format!("no response within {} s", wait.as_secs())),
-    })
+    }
 }
 
 /// Get one contract and time the answer. The state is compared, so a get that
@@ -235,6 +263,7 @@ async fn timed_get(
     want: &[u8],
     return_code: bool,
     wait: Duration,
+    stale: &mut usize,
 ) -> Result<Sample> {
     let t = Instant::now();
     send_req(
@@ -250,25 +279,47 @@ async fn timed_get(
         wait,
     )
     .await?;
-    Ok(match timeout(wait, client.recv()).await {
-        Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
-            state: got,
-            ..
-        }))) => {
-            if got.as_ref() == want {
-                Sample::Ms(ms_since(t))
-            } else {
-                Sample::Failed(format!(
-                    "state mismatch: got {} B, expected {} B",
-                    got.as_ref().len(),
-                    want.len()
-                ))
+    let deadline = t + wait;
+    loop {
+        let Some(left) = deadline.checked_duration_since(Instant::now()) else {
+            return Ok(Sample::Failed(format!(
+                "no response within {} s",
+                wait.as_secs()
+            )));
+        };
+        match timeout(left, client.recv()).await {
+            Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
+                key: k,
+                state: got,
+                ..
+            }))) => {
+                // Keyed, not "the next GetResponse". Comparing an answer for
+                // another key against these bytes reports a state mismatch,
+                // which reads as a node fault and is an instrument fault.
+                if k.id() != key.id() {
+                    *stale += 1;
+                    continue;
+                }
+                return Ok(if got.as_ref() == want {
+                    Sample::Ms(ms_since(t))
+                } else {
+                    Sample::Failed(format!(
+                        "state mismatch: got {} B, expected {} B",
+                        got.as_ref().len(),
+                        want.len()
+                    ))
+                });
+            }
+            Ok(Ok(_other)) => *stale += 1,
+            Ok(Err(e)) => return Ok(Sample::Failed(format!("node error: {e}"))),
+            Err(_) => {
+                return Ok(Sample::Failed(format!(
+                    "no response within {} s",
+                    wait.as_secs()
+                )))
             }
         }
-        Ok(Ok(other)) => Sample::Failed(format!("unexpected response: {other:?}")),
-        Ok(Err(e)) => Sample::Failed(format!("node error: {e}")),
-        Err(_) => Sample::Failed(format!("no response within {} s", wait.as_secs())),
-    })
+    }
 }
 
 /// Put and warm-get one (kind, size) `n` times.
@@ -281,6 +332,8 @@ struct Series {
     /// took this long", and a table that prints only what came back cannot
     /// tell them apart.
     wanted: usize,
+    /// Answers to requests this series had already given up on, discarded.
+    stale: usize,
     put: Vec<Sample>,
     get: Vec<Sample>,
 }
@@ -310,6 +363,12 @@ async fn measure_series(
         deadline,
     } = spec;
     let over = || deadline.is_some_and(|d| Instant::now() >= d);
+    // Answers to requests this series had already given up on. Counted, not
+    // silently dropped: they are the measure of how much the run is running
+    // ahead of the node, and a series with many of them is one whose
+    // percentiles were taken while the connection was still catching up.
+    let mut stale_put = 0usize;
+    let mut stale_get = 0usize;
     let mut put = Vec::with_capacity(n);
     let mut held: Vec<(ContractKey, Vec<u8>)> = Vec::with_capacity(n);
     for i in 0..n {
@@ -329,7 +388,7 @@ async fn measure_series(
         let (contract, state) = (kind.make)(code, size)?;
         let key = contract.key();
         minted.add(*key.id());
-        let s = timed_put(client, contract, &state, wait).await?;
+        let s = timed_put(client, contract, &state, wait, &mut stale_put).await?;
         // Only a block the node acknowledged is a block it can serve warm.
         if matches!(s, Sample::Ms(_)) {
             held.push((key, state));
@@ -355,7 +414,7 @@ async fn measure_series(
         if over() {
             break;
         }
-        get.push(timed_get(client, key, state, return_code, wait).await?);
+        get.push(timed_get(client, key, state, return_code, wait, &mut stale_get).await?);
     }
     progress_pub(format_args!(
         "  {} {} done ({} of {n} put, {} get)",
@@ -364,10 +423,18 @@ async fn measure_series(
         put.len(),
         get.len()
     ));
+    if stale_put + stale_get > 0 {
+        progress_pub(format_args!(
+            "  {} {} discarded {stale_put} late put answers and {stale_get} late get answers",
+            kind.name,
+            kib(size)
+        ));
+    }
     Ok(Series {
         kind: kind.name,
         size,
         wanted: n,
+        stale: stale_put + stale_get,
         put,
         get,
     })
@@ -504,8 +571,9 @@ async fn measure_readable(
         minted.add(*key.id());
         // One clock for both, so the two numbers are comparable.
         let t0 = Instant::now();
+        let mut stale = 0usize;
         let (put, readable) = tokio::join!(
-            timed_put(writer, contract, &state, wait),
+            timed_put(writer, contract, &state, wait, &mut stale),
             poll_readable(reader, &key, &state, t0, wait, Duration::from_millis(50))
         );
         let (put, readable) = (put?, readable?);
@@ -1109,6 +1177,15 @@ fn print_series(series: &[Series], pick: fn(&Series) -> &Vec<Sample>) {
         let samples = pick(s);
         let lat = latencies(samples);
         let errs = failures(samples);
+        if s.stale > 0 {
+            notes.push(format!(
+                "{} {}: {} late answer(s) to requests already given up on were discarded, \
+                 not charged to a later sample",
+                s.kind,
+                kib(s.size),
+                s.stale
+            ));
+        }
         if samples.len() < s.wanted {
             notes.push(format!(
                 "{} {}: {} of {} samples taken — the run reached its budget, \
