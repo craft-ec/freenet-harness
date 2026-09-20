@@ -203,6 +203,85 @@ async fn trial(
     Ok(out)
 }
 
+/// Was this trial still unacknowledged when `t` came round?
+///
+/// The control never hedges, so its population has to be computed from its own
+/// acknowledgement times, and it must mean the SAME thing as the hedged arm's
+/// "a hedge fired here". Two cases are easy to get wrong and both move every
+/// number in the conditional table:
+///
+/// - a trial whose ack arrived EXACTLY at `t` was not waiting at `t`, so the
+///   comparison is strictly greater-than;
+/// - a trial that NEVER acked is the most unacknowledged trial there is. It
+///   counts. Dropping it would quietly select for the trials that recovered,
+///   which is the population the hedge exists to rescue.
+fn unacked_at(x: &Trial, t: Duration) -> bool {
+    match x.ack {
+        Some(a) => a > t.as_secs_f64() * 1000.0,
+        None => true,
+    }
+}
+
+/// What the control did, unaided, on the population a hedge fires on.
+///
+/// Both halves, always. The single-number form — "96 % acked anyway, so 96 % of
+/// hedges were unnecessary" — answered *would it have acked?* when the question
+/// is *would it have acked IN TIME?*, and so counted the hedge's best case as
+/// its waste. It read as sensible on a datacentre pilot, where there is barely
+/// a tail, and was badly wrong on the hotspot, where the unaided acks it called
+/// fine had a p90 of 61 seconds.
+struct Unaided {
+    pool: usize,
+    acked: usize,
+    p50: Option<f64>,
+    p90: Option<f64>,
+}
+
+impl Unaided {
+    fn of(control: &[Trial], t: Duration) -> Self {
+        let pool: Vec<&Trial> = control.iter().filter(|x| unacked_at(x, t)).collect();
+        let acks: Vec<f64> = pool.iter().filter_map(|x| x.ack).collect();
+        let s = Summary::of(&acks);
+        Unaided {
+            pool: pool.len(),
+            acked: acks.len(),
+            p50: s.map(|s| s.p50),
+            p90: s.map(|s| s.p90),
+        }
+    }
+
+    /// The line that replaced the misleading one.
+    fn line(&self) -> String {
+        match (self.pool, self.p50, self.p90) {
+            (0, _, _) | (_, None, _) | (_, _, None) => {
+                "no control population at this T to compare against".to_string()
+            }
+            (pool, Some(p50), Some(p90)) => format!(
+                "of the {pool} control trials in the same state, {} acked without help — but at p50 {p50:.0} ms and p90 {p90:.0} ms, so \"unnecessary\" is the wrong word wherever that is slower than the hedged arm above",
+                self.acked
+            ),
+        }
+    }
+
+    /// The form this replaced, kept so the suite can show what it said.
+    ///
+    /// Not dead weight: a defect that is only described is a defect the next
+    /// person re-introduces, and the test that pins it is the only place the
+    /// old wording can be compared against the new one.
+    #[cfg(test)]
+    fn misleading_line(&self, hedges: usize) -> String {
+        if self.pool == 0 {
+            return "no control population to compare against".to_string();
+        }
+        let rate = self.acked as f64 / self.pool as f64;
+        format!(
+            "in the control, {:.0} % of trials still unacked at that point acked anyway, so about {:.0} of these hedges were probably unnecessary",
+            100.0 * rate,
+            rate * hedges as f64
+        )
+    }
+}
+
 pub struct Opts {
     pub wasm: String,
     pub expect_sha: String,
@@ -403,12 +482,6 @@ pub async fn run(ws: &str, o: Opts) -> Result<()> {
         "ack p90",
         "ack max",
     ]);
-    let late = |x: &&Trial, t: Duration| -> bool {
-        match x.ack {
-            Some(a) => a > t.as_secs_f64() * 1000.0,
-            None => true,
-        }
-    };
     for arm in arms.iter().filter(|a| a.t.is_some()) {
         let t = arm.t.expect("filtered");
         for (label, pool) in [
@@ -417,7 +490,7 @@ pub async fn run(ws: &str, o: Opts) -> Result<()> {
                 control
                     .trials
                     .iter()
-                    .filter(|x| late(x, t))
+                    .filter(|x| unacked_at(x, t))
                     .collect::<Vec<_>>(),
             ),
             (
@@ -475,27 +548,12 @@ pub async fn run(ws: &str, o: Opts) -> Result<()> {
     for arm in arms.iter().filter(|a| a.t.is_some()) {
         let hedges = arm.trials.iter().filter(|x| x.hedged).count();
         let t = arm.t.expect("filtered to hedged arms");
-        let pool: Vec<&Trial> = control.trials.iter().filter(|x| late(x, t)).collect();
-        let acked_anyway = pool.iter().filter(|x| x.ack.is_some()).count();
-        let when = Summary::of(&pool.iter().filter_map(|x| x.ack).collect::<Vec<f64>>());
         println!(
             "   {}: {hedges} extra puts, {} extra on the wire",
             arm.name(),
             kib(hedges * (o.size + code_len))
         );
-        match (pool.is_empty(), when) {
-            (true, _) | (_, None) => {
-                println!("      no control population at this T to compare against")
-            }
-            (false, Some(w)) => println!(
-                "      of the {} control trials in the same state, {acked_anyway} acked without help — \
-                 but at p50 {:.0} ms and p90 {:.0} ms, so \"unnecessary\" is the wrong word \
-                 wherever that is slower than the hedged arm above",
-                pool.len(),
-                w.p50,
-                w.p90
-            ),
-        }
+        println!("      {}", Unaided::of(&control.trials, t).line());
     }
 
     println!();
@@ -524,4 +582,132 @@ pub async fn run(ws: &str, o: Opts) -> Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A trial with a given acknowledgement time, or none at all.
+    fn t(ack: Option<f64>) -> Trial {
+        Trial {
+            ack,
+            readable: Some(500.0),
+            hedged: false,
+        }
+    }
+
+    const T2: Duration = Duration::from_millis(2000);
+
+    /// The population is what every number in the conditional table rests on,
+    /// and both of these cases move it.
+    #[test]
+    fn a_trial_that_never_acked_is_the_most_unacknowledged_trial_there_is() {
+        assert!(
+            unacked_at(&t(None), T2),
+            "never-acked counts, it is not dropped"
+        );
+        // Dropping it would silently select for the trials that recovered —
+        // exactly the population a hedge exists to rescue.
+        let control = vec![t(Some(500.0)), t(None), t(Some(9000.0))];
+        let u = Unaided::of(&control, T2);
+        assert_eq!(
+            u.pool, 2,
+            "the 500 ms trial was not waiting at 2 s; the other two were"
+        );
+        assert_eq!(u.acked, 1, "only one of those two ever acked");
+    }
+
+    #[test]
+    fn the_boundary_is_strictly_after_t() {
+        // Acked AT t was not waiting at t.
+        assert!(!unacked_at(&t(Some(2000.0)), T2));
+        assert!(unacked_at(&t(Some(2000.1)), T2));
+        assert!(!unacked_at(&t(Some(1999.9)), T2));
+    }
+
+    /// THE WORKED EXAMPLE. The old single-number line on a fixture shaped like
+    /// the hotspot result: every unaided trial acked, and its p90 is 61 s.
+    #[test]
+    fn the_old_waste_line_calls_a_61_second_wait_unnecessary() {
+        // Twenty fast and five in the tail. Nearest-rank p90 over 25 samples is
+        // the 23rd, so the tail must be at least three deep for the p90 to sit
+        // in it; a single slow sample left the p90 at 3000 ms and this test
+        // said so — the fixture did not have the shape it claimed.
+        let mut control: Vec<Trial> = (0..20).map(|_| t(Some(3000.0))).collect();
+        control.extend((0..5).map(|_| t(Some(61_000.0))));
+        let u = Unaided::of(&control, T2);
+        assert_eq!(u.pool, 25);
+        assert_eq!(u.acked, 25);
+        assert!(u.p90.is_some_and(|p| p >= 61_000.0), "p90 is in the tail");
+
+        let old = u.misleading_line(25);
+        assert!(old.contains("100 %"), "{old}");
+        assert!(old.contains("probably unnecessary"), "{old}");
+        // That is the defect: a population whose p90 is 61 seconds, described
+        // as one that did not need help.
+        assert!(
+            !old.contains("61000"),
+            "the old line never showed WHEN they acked"
+        );
+
+        let new = u.line();
+        assert!(new.contains("25 acked without help"), "{new}");
+        assert!(new.contains("p90 61000 ms"), "{new}");
+        assert!(new.contains("\"unnecessary\" is the wrong word"), "{new}");
+    }
+
+    /// And on a fixture with no tail — the datacentre shape — the new line is
+    /// still correct rather than alarmist: it reports the same two halves and
+    /// lets the reader see that the unaided acks were fast.
+    #[test]
+    fn with_no_tail_the_new_line_reports_fast_unaided_acks() {
+        let control: Vec<Trial> = (0..12).map(|_| t(Some(2500.0))).collect();
+        let u = Unaided::of(&control, T2);
+        let s = u.line();
+        assert!(s.contains("p50 2500 ms and p90 2500 ms"), "{s}");
+        assert!(s.contains("12 acked without help"), "{s}");
+    }
+
+    #[test]
+    fn an_empty_population_claims_nothing() {
+        let control = vec![t(Some(100.0)), t(Some(200.0))];
+        let u = Unaided::of(&control, T2);
+        assert_eq!(u.pool, 0);
+        assert!(u.line().contains("no control population"));
+        assert!(u.misleading_line(5).contains("no control population"));
+    }
+
+    /// A population that never acked at all has a pool but no percentiles, and
+    /// must not print a ratio over nothing.
+    #[test]
+    fn a_population_that_never_acked_has_no_percentiles() {
+        let control = vec![t(None), t(None)];
+        let u = Unaided::of(&control, T2);
+        assert_eq!((u.pool, u.acked), (2, 0));
+        assert!(u.line().contains("no control population at this T"));
+    }
+
+    /// The floor below which a cell must refuse to show a ratio. Mirrors the
+    /// rule in the table: a percentile over four samples is a number a reader
+    /// will quote and should not.
+    #[test]
+    fn below_min_report_a_cell_shows_no_finding_and_no_ratio() {
+        let min_report = 5usize;
+        for pool in 0..min_report {
+            let cell = cell_text(pool, min_report);
+            assert!(cell.starts_with("no finding"), "n={pool}: {cell}");
+            assert!(!cell.contains('%'), "n={pool}: {cell}");
+        }
+        assert!(!cell_text(min_report, min_report).starts_with("no finding"));
+    }
+
+    /// The decision the table makes for one cell, as a string.
+    fn cell_text(pool: usize, min_report: usize) -> String {
+        if pool < min_report {
+            format!("no finding (n={pool} < {min_report})")
+        } else {
+            format!("p50 over {pool} samples")
+        }
+    }
 }
