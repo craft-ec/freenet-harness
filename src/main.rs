@@ -88,6 +88,21 @@ enum Cmd {
         /// Probe delegate used for the delegate-put question.
         #[arg(long, default_value = "build/probe.wasm")]
         delegate_wasm: String,
+        /// Which contract kinds to measure. The other artefacts are taken
+        /// from the directory `--wasm` names, because one build.sh writes all
+        /// of them.
+        ///
+        /// Default: Block alone. A run that measured four kinds by default
+        /// would take four times as long on a node behind a hotspot, and the
+        /// rule here is one condition at a time.
+        #[arg(long, value_delimiter = ',', default_values_t = [String::from("Block")])]
+        kinds: Vec<String>,
+        /// `<kind>=<sha256 prefix>` for EVERY kind measured — the hashes
+        /// freenet-contracts/build.sh printed. Not optional: a run that timed
+        /// a stale artefact and a run that timed the shipped one print the
+        /// same table.
+        #[arg(long, value_delimiter = ',')]
+        expect_sha: Vec<String>,
         /// Samples per kind and size. The issue asks for at least 30.
         #[arg(long, default_value_t = 30)]
         samples: usize,
@@ -689,6 +704,8 @@ async fn main() -> Result<()> {
         Cmd::Latency {
             wasm,
             delegate_wasm,
+            kinds,
+            expect_sha,
             samples,
             sizes,
             parallel,
@@ -702,6 +719,8 @@ async fn main() -> Result<()> {
                 &ws,
                 &wasm,
                 &delegate_wasm,
+                &kinds,
+                &expect_sha,
                 samples,
                 &sizes,
                 &parallel,
