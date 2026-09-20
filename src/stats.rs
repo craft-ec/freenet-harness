@@ -169,6 +169,39 @@ impl Grid {
     }
 }
 
+/// What a run that lost NOTHING is allowed to claim.
+///
+/// Zero failures in `n` trials does not mean the failure rate is zero. The rule
+/// of three puts the 95 % upper bound at about `3/n`, so 0 of 60 supports "below
+/// about 5 %" and nothing stronger. Writing "durable" under such a table claims
+/// something the sample cannot carry, and the number of trials is exactly the
+/// thing a reader cannot recover from the word.
+///
+/// Returns the sentence for the caption. `lost > 0` needs no bound — the
+/// observed rate is the finding.
+pub fn loss_claim(lost: usize, n: usize) -> String {
+    if n == 0 {
+        return "no trials — nothing is claimed".to_string();
+    }
+    if lost > 0 {
+        return format!(
+            "{lost} of {n} lost — an observed loss rate of {:.1} %",
+            100.0 * lost as f64 / n as f64
+        );
+    }
+    let bound = 300.0 / n as f64;
+    if bound >= 100.0 {
+        // 3/n above one is not a bound, it is arithmetic with no content, and
+        // printing "below about 300 %" invites ridicule where the honest
+        // statement is that the sample is too small to say anything.
+        return format!("0 of {n} lost — too few trials to bound the loss rate at all");
+    }
+    format!(
+        "0 of {n} lost — by the rule of three that bounds the loss rate below about {bound:.1} %, \
+         which is NOT the same as durable"
+    )
+}
+
 /// `16384` → `16 KiB`, for table labels.
 pub fn kib(bytes: usize) -> String {
     if bytes >= 1024 && bytes.is_multiple_of(1024) {
@@ -257,6 +290,32 @@ mod tests {
         // And a series that is genuinely inside one step stays flagged however
         // fine the grid is, because it genuinely is inside one step.
         assert!(Grid::new(60.0, 10.0).unresolved("1x", &stuck).is_some());
+    }
+
+    /// The claim must weaken as the sample shrinks, and must switch to the
+    /// observed rate the moment anything is lost.
+    #[test]
+    fn a_clean_run_claims_a_bound_and_never_the_word_durable() {
+        let sixty = loss_claim(0, 60);
+        assert!(sixty.contains("0 of 60"));
+        assert!(sixty.contains("5.0 %"), "{sixty}");
+        assert!(sixty.contains("NOT the same as durable"));
+        // Ten trials can say much less than sixty, and says so.
+        assert!(loss_claim(0, 10).contains("30.0 %"));
+        // Anything lost is reported as a rate, with no bound language.
+        let one = loss_claim(1, 20);
+        assert!(one.contains("1 of 20"));
+        assert!(one.contains("5.0 %"));
+        assert!(!one.contains("rule of three"));
+        assert!(loss_claim(0, 0).contains("nothing is claimed"));
+        // A "bound" of 300 % is arithmetic with no content. Three trials or
+        // fewer say nothing, and the sentence says so instead.
+        for n in [1, 2, 3] {
+            let s = loss_claim(0, n);
+            assert!(s.contains("too few trials"), "n={n}: {s}");
+            assert!(!s.contains("rule of three"), "n={n}: {s}");
+        }
+        assert!(loss_claim(0, 4).contains("75.0 %"));
     }
 
     #[test]

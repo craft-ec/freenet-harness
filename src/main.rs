@@ -3,6 +3,7 @@
 
 mod bag;
 mod group;
+mod kill9;
 mod latency;
 mod pack;
 mod putshape;
@@ -254,6 +255,37 @@ enum Cmd {
         group_secs: u64,
         /// Total seconds for the whole run; 0 turns it off.
         #[arg(long, default_value_t = 600)]
+        budget_secs: u64,
+    },
+    /// Does a read-back-confirmed PUT survive kill -9 of the node? Spawns its
+    /// OWN node on its own port with a temp data dir, and kills only that.
+    Kill9 {
+        #[arg(long, default_value = "../freenet-contracts/build/block.wasm")]
+        wasm: String,
+        #[arg(long)]
+        expect_sha: String,
+        /// Port for the node this run starts. Never the owner's 7509 or 7609.
+        #[arg(long, default_value_t = 7909)]
+        port: u16,
+        #[arg(long, value_delimiter = ',', default_values_t = [4096usize, 262144, 1048576])]
+        sizes: Vec<usize>,
+        /// Milliseconds between the read-back and the kill.
+        #[arg(long, value_delimiter = ',', default_values_t = [0u64, 50, 500, 5000])]
+        delays_ms: Vec<u64>,
+        /// Build each state as a PACK of RAW members instead of one RAW block.
+        /// A 1 MiB RAW body is refused by block.wasm (MAX_BODY = 262,208); a
+        /// 1 MiB PACK is what a commit actually puts.
+        #[arg(long, default_value_t = false)]
+        pack: bool,
+        /// Trials per delay, matched positionally to --delays-ms. Not one
+        /// number for the table: the trials are worth most in the window right
+        /// after the read-back, which is where a loss would be.
+        #[arg(long, value_delimiter = ',', default_values_t = [20usize, 20, 10, 10])]
+        n_per_delay: Vec<usize>,
+        /// Trials for the control cell of each size.
+        #[arg(long, default_value_t = 10)]
+        n_control: usize,
+        #[arg(long, default_value_t = 3600)]
         budget_secs: u64,
     },
     /// Set contract live-node round trip. Runs in --local.
@@ -790,6 +822,30 @@ async fn main() -> Result<()> {
                     budget_secs,
                 },
             )
+            .await?;
+        }
+        Cmd::Kill9 {
+            wasm,
+            expect_sha,
+            port,
+            sizes,
+            pack,
+            delays_ms,
+            n_per_delay,
+            n_control,
+            budget_secs,
+        } => {
+            kill9::run(kill9::Opts {
+                wasm,
+                expect_sha,
+                port,
+                sizes,
+                pack,
+                delays_ms,
+                n_per_delay,
+                n_control,
+                budget_secs,
+            })
             .await?;
         }
         Cmd::Set { wasm, expect_sha } => {
