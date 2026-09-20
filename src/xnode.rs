@@ -831,11 +831,40 @@ async fn probe_once(
         Duration::from_secs(30),
     )
     .await?;
-    match timeout(bound, client.recv()).await {
-        Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse { state, .. }))) => {
-            Ok(Some(state.as_ref().len()))
+    // Keyed, and it has to be. The drain above matches by key; this branch did
+    // not, so ANY GetResponse satisfied ANY probe and one key's answer was
+    // credited to another key's wait. With one probe per key that is not a
+    // rare mix-up, it is the normal case: the far-node reader reported all 200
+    // keys readable in 15.7 s while the writer was still sending for 24.0 s,
+    // and the pairing guard refused exactly half the pairs as "the hit
+    // preceded its send". The same defect the latency module names
+    // `the_old_next_response_wins_logic`.
+    //
+    // Answers for other keys are consumed and discarded until this key's
+    // answer arrives or the bound expires, so a foreign answer costs this
+    // probe time but never a false hit.
+    // `Awaiting` rather than a second hand-rolled comparison: this crate
+    // already owns one implementation of "is this the answer I asked for",
+    // with its own tests, and the reason this branch was wrong is that xnode
+    // did not use it.
+    let end = std::time::Instant::now() + bound;
+    let mut waiting = crate::latency::Awaiting::new(*id);
+    loop {
+        let Some(left) = end.checked_duration_since(std::time::Instant::now()) else {
+            return Ok(None);
+        };
+        let (arrived, len) = match timeout(left, client.recv()).await {
+            Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
+                key: k,
+                state,
+                ..
+            }))) => (Some(*k.id()), Some(state.as_ref().len())),
+            Ok(Ok(_)) => (None, None),
+            Ok(Err(_)) | Err(_) => return Ok(None),
+        };
+        if waiting.offer(arrived.as_ref()) {
+            return Ok(len);
         }
-        Ok(Ok(_)) | Ok(Err(_)) | Err(_) => Ok(None),
     }
 }
 
@@ -1588,5 +1617,39 @@ mod tests {
         // And a run with no conditioned trials at all is not a comparison
         // either — the emptiest case must not fall through to Comparable.
         assert_eq!(verdict(&[]), Verdict::NoFinding { smaller_arm: 0 });
+    }
+
+    /// The defect that voided run 4, as a script the old logic cannot pass.
+    ///
+    /// `probe_once`'s awaited branch took ANY `GetResponse` as the answer to
+    /// the key it had asked about. With one probe per key that is not a rare
+    /// mix-up, it is the normal case: the far-node reader reported all 200
+    /// keys readable in 15.7 s while the writer was still sending for 24.0 s,
+    /// and the pairing guard refused exactly half the pairs as impossible.
+    #[test]
+    fn a_probe_is_answered_only_by_the_key_it_asked_about() {
+        use crate::latency::Awaiting;
+        let mine = 7u8;
+        let someone_elses = 9u8;
+
+        let mut w = Awaiting::new(mine);
+        assert!(
+            !w.offer(Some(&someone_elses)),
+            "another key's answer ended this probe — that is the whole defect"
+        );
+        assert!(
+            !w.offer(None),
+            "a message with no key is not an answer either"
+        );
+        assert_eq!(w.stale, 2, "and both are counted, not silently dropped");
+        assert!(w.offer(Some(&mine)), "the awaited key's answer ends it");
+
+        // The control: without the keyed check, the first arrival wins and the
+        // probe reports a hit for a key nobody answered about.
+        let first_arrival_wins = |_arrived: Option<&u8>| true;
+        assert!(
+            first_arrival_wins(Some(&someone_elses)),
+            "this is what the old branch did, and it is why the run was void"
+        );
     }
 }
