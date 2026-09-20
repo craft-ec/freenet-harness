@@ -105,6 +105,12 @@ enum Cmd {
         /// the state — does code ride reads as well as writes?
         #[arg(long, default_value_t = false)]
         return_code: bool,
+        /// Total seconds for the WHOLE run. At the budget it reports what it
+        /// has and says what it did not measure; 0 turns it off. Nobody is
+        /// sitting here watching, so a run with no budget is a run that can
+        /// take a night.
+        #[arg(long, default_value_t = 600)]
+        budget_secs: u64,
     },
     /// What does the host's re-validation of the full state after every
     /// update actually cost? Uses the validate-cost fixture.
@@ -542,6 +548,7 @@ async fn main() -> Result<()> {
             max_k,
             only,
             return_code,
+            budget_secs,
         } => {
             latency::run(
                 &ws,
@@ -554,6 +561,7 @@ async fn main() -> Result<()> {
                 max_k,
                 only,
                 return_code,
+                budget_secs,
                 wait,
             )
             .await?;

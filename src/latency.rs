@@ -275,6 +275,12 @@ async fn timed_get(
 struct Series {
     kind: &'static str,
     size: usize,
+    /// How many samples were ASKED for. A series that stopped at its budget
+    /// reports fewer than this, and the gap is the measurement: "we did not
+    /// wait long enough to find out" is a different statement from "30 puts
+    /// took this long", and a table that prints only what came back cannot
+    /// tell them apart.
+    wanted: usize,
     put: Vec<Sample>,
     get: Vec<Sample>,
 }
@@ -285,6 +291,8 @@ struct SeriesSpec {
     size: usize,
     n: usize,
     return_code: bool,
+    /// When this series must stop, whatever it has. `None` = no budget.
+    deadline: Option<Instant>,
 }
 
 async fn measure_series(
@@ -299,10 +307,25 @@ async fn measure_series(
         size,
         n,
         return_code,
+        deadline,
     } = spec;
+    let over = || deadline.is_some_and(|d| Instant::now() >= d);
     let mut put = Vec::with_capacity(n);
     let mut held: Vec<(ContractKey, Vec<u8>)> = Vec::with_capacity(n);
     for i in 0..n {
+        // The budget is checked BEFORE a sample is started, never during: a
+        // sample cut off half way is not a fast sample and must not enter the
+        // distribution. What the budget costs is samples not taken, and that
+        // is what the table reports.
+        if over() {
+            progress_pub(format_args!(
+                "  {} {} budget reached after {} of {n} puts",
+                kind.name,
+                kib(size),
+                i
+            ));
+            break;
+        }
         let (contract, state) = (kind.make)(code, size)?;
         let key = contract.key();
         minted.add(*key.id());
@@ -329,17 +352,22 @@ async fn measure_series(
     }
     let mut get = Vec::with_capacity(held.len());
     for (key, state) in held.iter() {
+        if over() {
+            break;
+        }
         get.push(timed_get(client, key, state, return_code, wait).await?);
     }
     progress_pub(format_args!(
-        "  {} {} done ({n} put, {} get)",
+        "  {} {} done ({} of {n} put, {} get)",
         kind.name,
         kib(size),
-        held.len()
+        put.len(),
+        get.len()
     ));
     Ok(Series {
         kind: kind.name,
         size,
+        wanted: n,
         put,
         get,
     })
@@ -891,6 +919,7 @@ pub async fn run(
     max_k: usize,
     only: Part,
     return_code: bool,
+    budget_secs: u64,
     wait: Duration,
 ) -> Result<()> {
     if samples == 0 {
@@ -901,6 +930,20 @@ pub async fn run(
     })?));
     let version = node_version();
     describe_environment(&version);
+
+    // One deadline for the whole run, not one per part. A budget that resets
+    // between parts is not a budget: four parts of "at most ten minutes" is
+    // forty, and the reason to have one at all is that nobody is sitting here
+    // watching. 0 turns it off.
+    let budget = (budget_secs > 0).then(|| Instant::now() + Duration::from_secs(budget_secs));
+    match budget {
+        Some(_) => println!("budget:   {budget_secs} s for the whole run; what is not measured by then is reported as not measured"),
+        None => println!("budget:   none (--budget-secs 0)"),
+    }
+    let spent = || match budget {
+        Some(d) => Instant::now() >= d,
+        None => false,
+    };
 
     let mut client = crate::connect(ws).await?;
     let mut minted = Minted::default();
@@ -918,6 +961,7 @@ pub async fn run(
                         size,
                         n: samples,
                         return_code,
+                        deadline: budget,
                     },
                     wait,
                     &mut minted,
@@ -933,7 +977,9 @@ pub async fn run(
     // 3. What does a PutResponse wait for? Put and poll for local readability
     //    off one clock, on two connections.
     let mut readable = Vec::new();
-    if only.wants(Part::Readable) {
+    if only.wants(Part::Readable) && spent() {
+        println!("part readable: SKIPPED — the run reached its budget before it started");
+    } else if only.wants(Part::Readable) {
         let mut reader = crate::connect(ws).await?;
         for kind in KINDS {
             for &size in sizes {
@@ -967,7 +1013,9 @@ pub async fn run(
 
     // 4. Parallel puts on one connection.
     let mut runs = Vec::new();
-    if only.wants(Part::Parallel) {
+    if only.wants(Part::Parallel) && spent() {
+        println!("part parallel: SKIPPED — the run reached its budget before it started");
+    } else if only.wants(Part::Parallel) {
         for &n in parallel {
             let r = measure_parallel(
                 &mut client,
@@ -991,7 +1039,9 @@ pub async fn run(
     // 5. Can a delegate put at all, and how many per process() return?
     let mut dputs = Vec::new();
     let mut delegate_note = String::new();
-    if only.wants(Part::DelegatePut) {
+    if only.wants(Part::DelegatePut) && spent() {
+        println!("part delegate-put: SKIPPED — the run reached its budget before it started");
+    } else if only.wants(Part::DelegatePut) {
         let block_code = std::fs::read(wasm)?;
         let mut salt = [0u8; 16];
         getrandom::getrandom(&mut salt)?;
@@ -1050,7 +1100,7 @@ pub async fn run(
 
 fn print_series(series: &[Series], pick: fn(&Series) -> &Vec<Sample>) {
     let mut t = Table::new(
-        ["kind", "size", "n", "errors", ">=240s", ">10xp50"]
+        ["kind", "size", "asked", "n", "errors", ">=240s", ">10xp50"]
             .into_iter()
             .chain(Summary::HEADINGS),
     );
@@ -1059,9 +1109,20 @@ fn print_series(series: &[Series], pick: fn(&Series) -> &Vec<Sample>) {
         let samples = pick(s);
         let lat = latencies(samples);
         let errs = failures(samples);
+        if samples.len() < s.wanted {
+            notes.push(format!(
+                "{} {}: {} of {} samples taken — the run reached its budget, \
+                 the rest are NOT within it",
+                s.kind,
+                kib(s.size),
+                samples.len(),
+                s.wanted
+            ));
+        }
         let head = vec![
             s.kind.to_string(),
             kib(s.size),
+            s.wanted.to_string(),
             lat.len().to_string(),
             errs.len().to_string(),
             stalls(samples).to_string(),
