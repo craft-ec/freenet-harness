@@ -5,6 +5,7 @@ mod bag;
 mod latency;
 mod stats;
 mod validate_cost;
+mod wasm_check;
 mod watch;
 mod xnode;
 
@@ -136,6 +137,10 @@ enum Cmd {
         work_bits: u8,
         #[arg(long, default_value_t = 8)]
         m: u16,
+        /// Refuse to run unless the wasm has this sha256 (prefix accepted).
+        /// A parameter, not a constant: these move on every contract change.
+        #[arg(long)]
+        expect_sha: Option<String>,
     },
     /// Cross-node: write blocks on one node, then measure on ANOTHER how
     /// long until each is readable there.
@@ -573,8 +578,13 @@ async fn main() -> Result<()> {
             )
             .await?;
         }
-        Cmd::Bag { wasm, work_bits, m } => {
-            bag::run(&ws, &wasm, work_bits, m, wait).await?;
+        Cmd::Bag {
+            wasm,
+            work_bits,
+            m,
+            expect_sha,
+        } => {
+            bag::run(&ws, &wasm, work_bits, m, expect_sha.as_deref(), wait).await?;
         }
         Cmd::Watch { key, secs } => {
             watch::run(&ws, &key, secs, wait).await?;

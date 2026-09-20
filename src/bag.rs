@@ -9,7 +9,7 @@
 
 use std::{sync::Arc, time::Duration};
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{bail, Result};
 use craftec_bag_contract::{
     testing,
     wire::{BagState, Params, Pointer},
@@ -97,15 +97,16 @@ fn count(params: &Params, state: &[u8]) -> usize {
         .unwrap_or(0)
 }
 
-pub async fn run(ws: &str, wasm: &str, work_bits: u8, m: u16, wait: Duration) -> Result<()> {
-    let bytes = std::fs::read(wasm)
-        .map_err(|e| anyhow!("{wasm}: {e} — run ../freenet-contracts/build.sh first"))?;
-    // A run says what it tested.
-    println!(
-        "bag.wasm: {} bytes  sha256={}",
-        bytes.len(),
-        hex16(&sha256(&bytes))
-    );
+pub async fn run(
+    ws: &str,
+    wasm: &str,
+    work_bits: u8,
+    m: u16,
+    expect_sha: Option<&str>,
+    wait: Duration,
+) -> Result<()> {
+    // Says what it tested, and refuses the wrong artefact outright.
+    let bytes = crate::wasm_check::load(wasm, expect_sha)?;
     let code = Arc::new(ContractCode::from(bytes));
     let mut p = testing::params(work_bits, m);
     // A fresh bucket per run, so every run addresses a NEW contract.
@@ -291,12 +292,4 @@ fn verdict(b: bool) -> &'static str {
     } else {
         "FAIL"
     }
-}
-
-fn sha256(b: &[u8]) -> [u8; 32] {
-    *blake3::hash(b).as_bytes()
-}
-
-fn hex16(b: &[u8; 32]) -> String {
-    b.iter().take(8).map(|x| format!("{x:02x}")).collect()
 }
