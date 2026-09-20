@@ -553,6 +553,7 @@ dependencies = [
  "craftec-block-contract",
  "craftec-register-contract",
  "craftec-set-contract",
+ "freenet-prolly",
  "freenet-stdlib",
  "getrandom 0.2.17",
  "sha2",
