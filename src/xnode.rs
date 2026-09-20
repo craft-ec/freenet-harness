@@ -908,6 +908,13 @@ async fn probe_once(
             Ok(Err(_)) | Err(_) => return Ok(None),
         };
         if waiting.offer(arrived.as_ref()) {
+            // A probe that came back with nothing is a MISS, not a failure and
+            // not an open request: the node answered, and the answer was "I do
+            // not have it".
+            client.finish_last(match len {
+                Some(_) => instrument::vocab::Outcome::Ok,
+                None => instrument::vocab::Outcome::Missing,
+            });
             return Ok(len);
         }
     }

@@ -24,8 +24,8 @@ use freenet_stdlib::client_api::{ClientRequest, HostResponse, WebApi};
 use instrument::{
     dump::render,
     label::{Kind, Labels},
-    vocab::{Dir, Key, Site},
-    Entry, Event, Label, Probe, Record, SyncRecorder,
+    vocab::{Dir, Key, Outcome, Site},
+    Entry, Event, Label, OpId, Probe, Record, SyncRecorder,
 };
 
 pub const SEND: Site = Site::of("harness::client::send");
@@ -44,6 +44,9 @@ const RING: usize = 1 << 16;
 /// be held on its own.
 pub struct Ledger {
     rec: Arc<SyncRecorder>,
+    /// The most recent request, so a caller can refine its outcome without
+    /// every `send` in the harness changing shape to return a handle.
+    last: std::sync::Mutex<Option<Label>>,
     /// The open requests, kept INCREMENTALLY.
     ///
     /// The recording can answer this by replaying its edges, and that is right
@@ -71,12 +74,19 @@ impl Ledger {
         Ledger {
             rec: Arc::new(SyncRecorder::with_capacity(RING)),
             open: std::sync::Mutex::new(Vec::new()),
+            last: std::sync::Mutex::new(None),
             labels: std::sync::Mutex::new(Labels::new()),
             seq: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
-    /// Record a request going out.
+    /// Record a request going out: an edge AND the start of an operation.
+    ///
+    /// The two are different facts. An edge says "asked, not yet answered";
+    /// a span says "an operation ran, and this is how it ended". A dump with
+    /// only edges cannot tell twelve operations still running from twelve the
+    /// caller abandoned from twelve whose answers arrived and were discarded
+    /// as stale — and the third is what voided a run.
     pub fn request(&self, what: &'static str) -> Label {
         let n = self.seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let key = format!("{what}/{n}");
@@ -98,11 +108,70 @@ impl Ledger {
                 value: 1,
             },
         });
+        self.rec.event(Event::Enter {
+            site: SEND,
+            op: OpId(id.ordinal),
+        });
+        if let Ok(mut l) = self.last.lock() {
+            *l = Some(id);
+        }
         match self.open.lock() {
             Ok(mut o) => o.push(id),
             Err(p) => p.into_inner().push(id),
         }
         id
+    }
+
+    /// Close an operation with the outcome the CALLER knows.
+    ///
+    /// The transport can see that an answer arrived; it cannot see that the
+    /// answer carried no state (`Missing`), that the caller's bounded wait
+    /// expired (`Timeout`), or that the bytes were not the ones asked for
+    /// (`Refused`). Those live at the call site, so the transport carries the
+    /// span and the call site refines it — rather than every subcommand
+    /// growing its own bookkeeping beside this one.
+    pub fn finish(&self, id: Label, outcome: Outcome) {
+        self.rec.event(Event::Exit {
+            site: SEND,
+            op: OpId(id.ordinal),
+            outcome,
+        });
+        // An operation that ended is no longer outstanding, however it ended.
+        // A timeout that left its edge open would be counted twice: once as a
+        // failure and again as a request nobody answered.
+        if let Ok(mut o) = self.open.lock() {
+            if let Some(i) = o.iter().position(|l| *l == id) {
+                o.remove(i);
+            }
+        }
+    }
+
+    /// Close the MOST RECENT operation with the caller's outcome.
+    ///
+    /// Honest about its limit: with several requests in flight, "the most
+    /// recent" is not necessarily the one that failed. It is exactly right for
+    /// the shapes that use it — a send that blocked, a single probe that went
+    /// unanswered — because in both the caller sent one request and is
+    /// standing over it. A caller pipelining several and wanting to refine one
+    /// of them should keep the `Label` that `request` handed back.
+    pub fn finish_last(&self, outcome: Outcome) {
+        let id = match self.last.lock() {
+            Ok(l) => *l,
+            Err(p) => *p.into_inner(),
+        };
+        if let Some(id) = id {
+            self.finish(id, outcome);
+        }
+    }
+
+    /// How many operations ended each way.
+    pub fn outcomes(&self) -> Vec<(Outcome, usize)> {
+        self.rec.recording().outcomes()
+    }
+
+    /// Operations begun and never ended.
+    pub fn unfinished(&self) -> usize {
+        self.rec.recording().unfinished().len()
     }
 
     /// Record an answer arriving.
@@ -129,6 +198,15 @@ impl Ledger {
                 site: RECV,
                 dir: Dir::Response,
                 id,
+            });
+            // The transport's own verdict: an answer came back. A caller that
+            // knows better — no state, wrong bytes — calls `finish` and says
+            // so; the Exit here is what makes a healthy run show every span
+            // closed rather than merely every edge paired.
+            self.rec.event(Event::Exit {
+                site: SEND,
+                op: OpId(id.ordinal),
+                outcome: Outcome::Ok,
             });
         }
         self.rec.event(Event::Counter {
@@ -161,11 +239,23 @@ impl Ledger {
     pub fn line(&self) -> String {
         let out = self.outstanding();
         let ids: Vec<String> = out.iter().take(4).map(|l| l.to_string()).collect();
+        let ended: Vec<String> = self
+            .outcomes()
+            .iter()
+            .map(|(o, n)| format!("{o:?}={n}"))
+            .collect();
+        let open_spans = self.unfinished();
         format!(
-            "sent {} received {} OUTSTANDING {}{}",
+            "sent {} received {} OUTSTANDING {} running {}{}{}",
             self.sent(),
             self.received(),
             out.len(),
+            open_spans,
+            if ended.is_empty() {
+                String::new()
+            } else {
+                format!(" ended[{}]", ended.join(" "))
+            },
             if ids.is_empty() {
                 String::new()
             } else {
@@ -231,6 +321,13 @@ impl Client {
 
     pub fn dump(&self, what: &'static str) -> String {
         self.ledger.dump(what)
+    }
+
+    /// Say how the operation just sent ended, when the caller knows better
+    /// than the transport can: no state came back, a bounded wait expired, the
+    /// bytes were not the ones asked for.
+    pub fn finish_last(&self, outcome: Outcome) {
+        self.ledger.finish_last(outcome)
     }
 }
 
@@ -374,6 +471,110 @@ mod tests {
         let n = l.outstanding().len();
         assert!(l.line().contains(&format!("OUTSTANDING {n}")));
         assert!(l.dump("x").contains(&format!("OUTSTANDING {n}")));
+    }
+
+    /// An OPEN EDGE does not say how an operation ended, and the three shapes
+    /// that leave the same edges open want different responses.
+    #[test]
+    fn a_timeout_and_a_slow_node_leave_different_dumps() {
+        // Still running: asked, no answer yet. Nobody has given up.
+        let running = Ledger::new();
+        for _ in 0..3 {
+            running.request("get");
+        }
+        assert_eq!(running.outstanding().len(), 3);
+        assert_eq!(running.unfinished(), 3, "three operations are still open");
+        assert!(running.outcomes().is_empty(), "none of them ENDED");
+
+        // Abandoned: the caller's bounded wait expired. The edges must not
+        // still be counted as outstanding — that would report the same failure
+        // twice, once as a timeout and again as a request nobody answered.
+        let gave_up = Ledger::new();
+        for _ in 0..3 {
+            gave_up.request("get");
+            gave_up.finish_last(Outcome::Timeout);
+        }
+        assert_eq!(
+            gave_up.outstanding().len(),
+            0,
+            "they ended, so they are not open"
+        );
+        assert_eq!(gave_up.unfinished(), 0);
+        assert_eq!(gave_up.outcomes(), vec![(Outcome::Timeout, 3)]);
+
+        // And the two dumps say different things, which is the whole point.
+        assert!(
+            running.line().contains("OUTSTANDING 3"),
+            "{}",
+            running.line()
+        );
+        assert!(!running.line().contains("ended["), "{}", running.line());
+        assert!(
+            gave_up.line().contains("OUTSTANDING 0"),
+            "{}",
+            gave_up.line()
+        );
+        assert!(gave_up.line().contains("Timeout=3"), "{}", gave_up.line());
+    }
+
+    /// A node that answers "I do not have it" has ANSWERED. That is a miss,
+    /// not a failure and not an open request.
+    #[test]
+    fn a_miss_is_an_outcome_not_an_open_edge() {
+        let l = Ledger::new();
+        l.request("get");
+        l.finish_last(Outcome::Missing);
+        assert_eq!(l.outstanding().len(), 0);
+        assert_eq!(l.outcomes(), vec![(Outcome::Missing, 1)]);
+        assert!(l.line().contains("Missing=1"), "{}", l.line());
+        assert!(
+            l.dump("miss").contains("outcome Missing: 1"),
+            "{}",
+            l.dump("miss")
+        );
+    }
+
+    /// A healthy run closes every span, not merely every edge.
+    #[test]
+    fn a_healthy_run_leaves_no_span_open() {
+        let l = Ledger::new();
+        for _ in 0..8 {
+            l.request("put");
+            l.response();
+        }
+        assert_eq!(l.outstanding().len(), 0);
+        assert_eq!(l.unfinished(), 0, "every span closed");
+        assert_eq!(l.outcomes(), vec![(Outcome::Ok, 8)]);
+        assert!(
+            l.dump("healthy").contains("unfinished spans 0"),
+            "{}",
+            l.dump("healthy")
+        );
+    }
+
+    /// A caller's verdict overrides the transport's, and does not double-count.
+    #[test]
+    fn refining_an_outcome_does_not_end_the_operation_twice() {
+        let l = Ledger::new();
+        l.request("get");
+        l.finish_last(Outcome::Refused(7));
+        // The caller spoke first; a later response must not add a second Exit
+        // for an operation that already ended.
+        let total = |l: &Ledger| l.outcomes().iter().map(|(_, n)| *n).sum::<usize>();
+        assert_eq!(total(&l), 1, "one operation, one ending");
+        assert_eq!(l.outstanding().len(), 0, "nothing is open to answer");
+
+        // A response arriving after the caller gave up must not add a second
+        // ending. Asserted as a NUMBER, not as `x == x`: the first version of
+        // this compared a value with itself and would have passed whatever the
+        // code did.
+        l.response();
+        assert_eq!(total(&l), 1, "a late answer added a second ending");
+        assert_eq!(
+            l.outcomes(),
+            vec![(Outcome::Refused(7), 1)],
+            "and it is still the caller's verdict, not the transport's"
+        );
     }
 
     /// What recording costs, measured against the grid it has to stay inside.

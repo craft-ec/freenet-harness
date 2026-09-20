@@ -350,6 +350,10 @@ pub(crate) async fn send_req_ctx(
     match timeout(wait, client.send(req)).await {
         Ok(r) => r,
         Err(_) => {
+            // The operation ENDED, and it ended in a timeout. Without this the
+            // dump would show an edge nobody answered, which is the same shape
+            // a slow node makes — and the two want different responses.
+            client.finish_last(instrument::vocab::Outcome::Timeout);
             // The message is now a PROJECTION of the recording rather than a
             // sentence someone wrote about it. "What the caller had not
             // drained" used to be a string each call site passed in by hand,
