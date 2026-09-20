@@ -228,6 +228,11 @@ pub async fn put_minted(
     let mut to_send = 0usize;
     let mut last_beat = std::time::Instant::now();
     let mut stopped_at_milestone = false;
+    // How long to wait for straggler acknowledgements once nothing else can
+    // change. The relay's flat wait is 60 s (F20), so this is one of those and
+    // not a budget for the run.
+    const SETTLE: Duration = Duration::from_secs(75);
+    let spent_waiting = std::time::Instant::now();
 
     // Phase 2: ONE loop for the three things that are all happening at once —
     // acknowledgements arriving, the hedge's instant coming round, and the
@@ -434,12 +439,42 @@ pub async fn put_minted(
             break;
         }
 
-        let done = to_send == plan.len()
-            && trials
-                .iter()
-                .all(|t| t.confirm_ms.is_some() && t.ack_ms.is_some() && t.marked);
-        if done {
+        // Everything that CAN still happen has happened.
+        //
+        // Every trial sent, and every trial's T has passed — so the conditioned
+        // population can no longer grow, whether or not it reached the
+        // milestone. Waiting on beyond that is waiting for a straggler
+        // acknowledgement, which is the relay tail (F20) and is not what this
+        // run measures. A run whose milestone became UNREACHABLE used to spin
+        // to its backstop: 200 sent, 24 of 25 conditioned in one arm, nothing
+        // left to send, 35 minutes of nothing.
+        let all_sent = to_send == plan.len();
+        let all_marked = trials.iter().all(|t| t.marked);
+        let all_settled = trials
+            .iter()
+            .all(|t| t.confirm_ms.is_some() && t.ack_ms.is_some());
+        if all_sent && all_marked && (all_settled || spent_waiting.elapsed() >= SETTLE) {
+            if until_conditioned > 0 && !stopped_at_milestone {
+                progress_pub(format_args!(
+                    "  milestone UNREACHABLE: {} control, {} hedge conditioned of the {} asked \
+                     for, and all {} trials are sent — nothing further can raise it",
+                    conditioned(Arm::Control),
+                    conditioned(Arm::Hedge),
+                    until_conditioned,
+                    trials.len()
+                ));
+            }
             break;
+        }
+        if !all_settled && all_sent && all_marked {
+            // Count down out loud rather than sit silent on the last ack.
+            if last_beat.elapsed() >= Duration::from_secs(5) {
+                progress_pub(format_args!(
+                    "  waiting on {} straggler ack(s) for up to {} more s",
+                    trials.iter().filter(|t| t.ack_ms.is_none()).count(),
+                    SETTLE.saturating_sub(spent_waiting.elapsed()).as_secs()
+                ));
+            }
         }
     }
 
@@ -779,11 +814,16 @@ const BURST: usize = 32;
 
 /// How long one probe waits for its answer.
 ///
-/// Short: a node that holds the block answers from its own store in a
-/// millisecond or two, and a node that does not hold it will not answer at
-/// all. Waiting longer buys nothing and costs every other key its place in the
-/// cycle.
-const PROBE_ONE: Duration = Duration::from_millis(20);
+/// Short, and it sets the instrument's RESOLUTION: the cycle is
+/// `pending keys x this`, so 20 ms over 200 keys was a 4,480 ms grid — wide
+/// enough to leave the arms' 532 ms difference unmeasured. A node that holds
+/// the block answers from its own store in about a millisecond; one that does
+/// not will never answer, however long the wait. So waiting longer buys
+/// nothing and costs every other key its place in the cycle.
+///
+/// A probe cut short is not a lost measurement: the key stays pending and is
+/// found on the next pass, one cycle later.
+const PROBE_ONE: Duration = Duration::from_millis(5);
 
 /// One bounded GET. `Some(len)` when this node served the state.
 /// `bound` is how long to wait for the ANSWER, not for the send.
@@ -1287,6 +1327,43 @@ pub fn report_hedge(rows: &[Joined], margin_ms: f64, grid_ms: f64) {
             "  the ack column is on the WRITER's own clock and is not on this grid; the \
              far-read column is."
         );
+    }
+    // The comparison this run exists to make is a DIFFERENCE BETWEEN ARMS, and
+    // a difference smaller than one grid step is not resolved — however many
+    // trials produced it. `Grid::unresolved` asks a different question (does
+    // one SERIES' whole spread fit inside a step), and it stays silent here
+    // because the spreads are wide while the gap between them is not.
+    if grid_ms > 0.0 {
+        let c = conditional(rows, Arm::Control);
+        let h = conditional(rows, Arm::Hedge);
+        for (what, a, b) in [
+            (
+                "p50",
+                Summary::of(&c.far).map(|x| x.p50),
+                Summary::of(&h.far).map(|x| x.p50),
+            ),
+            (
+                "p90",
+                Summary::of(&c.far).map(|x| x.p90),
+                Summary::of(&h.far).map(|x| x.p90),
+            ),
+        ] {
+            if let (Some(a), Some(b)) = (a, b) {
+                let d = (a - b).abs();
+                if d < grid_ms {
+                    println!(
+                        "  NOT RESOLVED at {what}: the arms differ by {d:.0} ms, inside one \
+                         {grid_ms:.0} ms step. This instrument cannot tell that apart from no \
+                         difference at all — it is not a small effect, it is an unmeasured one."
+                    );
+                } else {
+                    println!(
+                        "  resolved at {what}: the arms differ by {d:.0} ms, more than one \
+                         {grid_ms:.0} ms step"
+                    );
+                }
+            }
+        }
     }
     if let Verdict::NoFinding { smaller_arm } = verdict(rows) {
         println!(
