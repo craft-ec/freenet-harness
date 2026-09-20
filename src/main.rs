@@ -1,9 +1,13 @@
 //! Drives a real Freenet node: round-trips Blocks, measures put/get latency,
 //! probes delegate capabilities.
 
+mod bag;
 mod latency;
+mod register;
+mod set;
 mod stats;
 mod validate_cost;
+mod wasm_check;
 mod watch;
 mod xnode;
 
@@ -126,6 +130,33 @@ enum Cmd {
         /// the same contract; random when omitted.
         #[arg(long)]
         salt: Option<String>,
+    },
+    /// Bag contract live-node round trip (#7). Runs in --local.
+    Bag {
+        #[arg(long, default_value = "../freenet-contracts/build/bag.wasm")]
+        wasm: String,
+        #[arg(long, default_value_t = 8)]
+        work_bits: u8,
+        #[arg(long, default_value_t = 8)]
+        m: u16,
+        /// Refuse to run unless the wasm has this sha256 (prefix accepted).
+        /// A parameter, not a constant: these move on every contract change.
+        #[arg(long)]
+        expect_sha: Option<String>,
+    },
+    /// Register contract live-node round trip. Runs in --local.
+    Register {
+        #[arg(long, default_value = "../freenet-contracts/build/register.wasm")]
+        wasm: String,
+        #[arg(long)]
+        expect_sha: Option<String>,
+    },
+    /// Set contract live-node round trip. Runs in --local.
+    Set {
+        #[arg(long, default_value = "../freenet-contracts/build/set.wasm")]
+        wasm: String,
+        #[arg(long)]
+        expect_sha: Option<String>,
     },
     /// Cross-node: write blocks on one node, then measure on ANOTHER how
     /// long until each is readable there.
@@ -562,6 +593,20 @@ async fn main() -> Result<()> {
                 wait,
             )
             .await?;
+        }
+        Cmd::Bag {
+            wasm,
+            work_bits,
+            m,
+            expect_sha,
+        } => {
+            bag::run(&ws, &wasm, work_bits, m, expect_sha.as_deref(), wait).await?;
+        }
+        Cmd::Register { wasm, expect_sha } => {
+            register::run(&ws, &wasm, expect_sha.as_deref(), wait).await?;
+        }
+        Cmd::Set { wasm, expect_sha } => {
+            set::run(&ws, &wasm, expect_sha.as_deref(), wait).await?;
         }
         Cmd::Watch { key, secs } => {
             watch::run(&ws, &key, secs, wait).await?;

@@ -8,8 +8,16 @@ description = "Drives a real Freenet node: deploys contracts, round-trips state,
 
 [dependencies]
 craftec-block-contract = { path = "../freenet-contracts/block", default-features = false }
+# The Bag's own wire code and mining helpers: the harness must not have a
+# second opinion about the format it is testing.
+craftec-bag-contract = { path = "../freenet-contracts/bag", default-features = false, features = ["testing"] }
+craftec-register-contract = { path = "../freenet-contracts/register", default-features = false, features = ["testing"] }
+craftec-set-contract = { path = "../freenet-contracts/set", default-features = false, features = ["testing"] }
 freenet-stdlib = { version = "0.10.0", features = ["net"] }
 blake3 = "1"
+# For the contract-artifact check. The contracts' own build.sh reports
+# sha256, so the harness must speak the same digest or the check is theatre.
+sha2 = "0.10"
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = "0.27"
 anyhow = "1"
