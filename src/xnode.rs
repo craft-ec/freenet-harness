@@ -38,7 +38,7 @@ use freenet_stdlib::{
 use tokio::time::timeout;
 
 use crate::{
-    latency::{ms_since, send_req},
+    latency::{ms_since, progress_pub, send_req, send_req_ctx},
     stats::{kib, Summary, Table},
 };
 
@@ -225,6 +225,7 @@ pub async fn put_minted(
     let expected = plan.len();
     let mut trials: Vec<T> = Vec::with_capacity(expected);
     let mut to_send = 0usize;
+    let mut last_beat = std::time::Instant::now();
 
     // Phase 2: ONE loop for the three things that are all happening at once —
     // acknowledgements arriving, the hedge's instant coming round, and the
@@ -264,6 +265,13 @@ pub async fn put_minted(
                 Duration::from_secs(60),
             )
             .await?;
+            progress_pub(format_args!(
+                "  sent {}/{} {} {}",
+                trials.len() + 1,
+                plan.len(),
+                arm.as_str(),
+                key.id()
+            ));
             trials.push(T {
                 key,
                 size,
@@ -333,6 +341,12 @@ pub async fn put_minted(
                     .await?;
                     trials[i].hedged = true;
                     hedged_bytes += state.len();
+                    progress_pub(format_args!(
+                        "  hedged {} at T ({} of {} sent so far)",
+                        trials[i].key.id(),
+                        i + 1,
+                        plan.len()
+                    ));
                 }
             }
         }
@@ -358,6 +372,20 @@ pub async fn put_minted(
                 }
                 break;
             }
+        }
+
+        // A heartbeat, because a run that prints nothing until phase 3 is
+        // indistinguishable from a wedged one — `grep -c '^PUT'` returned 0
+        // seventy seconds into a 25-minute run, and that told nobody anything.
+        if last_beat.elapsed() >= Duration::from_secs(30) {
+            last_beat = std::time::Instant::now();
+            progress_pub(format_args!(
+                "  {} sent, {} acked, {} readable here, {} hedged",
+                trials.len(),
+                trials.iter().filter(|t| t.ack_ms.is_some()).count(),
+                trials.iter().filter(|t| t.confirm_ms.is_some()).count(),
+                trials.iter().filter(|t| t.hedged).count()
+            ));
         }
 
         let done = to_send == plan.len()
@@ -527,16 +555,41 @@ pub async fn read(
     let cold_confirmed = pending.len();
     println!("# control done: {cold_confirmed} cold, {warm_at_start} already readable");
 
-    // Send a probe for every pending key, THEN drain whatever comes back and
-    // match it by key. Send-then-wait-per-key does not work here: an abandoned
-    // response is never consumed, so after a few rounds the unread replies
-    // backpressure the socket and the next send blocks forever — the node has
-    // not "stopped accepting requests", this client stopped reading.
+    // Probe in BOUNDED rounds, then drain and match by key.
+    //
+    // Two failures have to be avoided at once, and the obvious fix for each is
+    // the other one's bug:
+    //
+    //  - Send-then-wait per key does not work: an abandoned response is never
+    //    consumed, the unread replies backpressure the socket, and the next
+    //    send blocks forever.
+    //  - Probing EVERY pending key in one burst does not work either, and this
+    //    is the one that killed a 200-key run: a GET for a key no node has yet
+    //    may never be answered at all, so the outstanding requests only grow,
+    //    the socket backpressures, and `send_req` trips its bound. It surfaces
+    //    as "the node stopped accepting requests" while the node is healthy —
+    //    the harness had stopped collecting.
+    //
+    // So a round probes at most [`BURST`] keys and rotates through the rest.
+    // That bounds what can be outstanding at any instant by something that
+    // does not depend on how many keys the run has — at the price of
+    // resolution, which the run PRINTS rather than leaves to be discovered: a
+    // key's first-readable time is resolved to a full cycle, not to one probe
+    // period.
     let mut first_reads = Vec::new();
     let deadline = std::time::Instant::now() + Duration::from_secs(limit_secs);
+    let rounds_per_cycle = pending.len().div_ceil(BURST).max(1);
+    let cycle_ms = rounds_per_cycle as u64 * probe_ms;
+    println!(
+        "# probe grid: {BURST} keys per round, {probe_ms} ms per round, {rounds_per_cycle} \
+         round(s) per cycle — a first-readable time is resolved to {cycle_ms} ms, not {probe_ms} ms"
+    );
+    let mut cursor = 0usize;
     while !pending.is_empty() && std::time::Instant::now() < deadline {
-        for (_, id, _, _) in &pending {
-            send_req(
+        let n = BURST.min(pending.len());
+        for step in 0..n {
+            let (_, id, _, _) = &pending[(cursor + step) % pending.len()];
+            send_req_ctx(
                 &mut client,
                 ClientRequest::ContractOp(ContractRequest::Get {
                     key: *id,
@@ -545,9 +598,16 @@ pub async fn read(
                     blocking_subscribe: false,
                 }),
                 Duration::from_secs(30),
+                &format!(
+                    "probe {} of {n} this round, {} key(s) still cold — a GET for a key no \
+                     node holds is never answered, so these do not drain",
+                    step + 1,
+                    pending.len()
+                ),
             )
             .await?;
         }
+        cursor = (cursor + n) % pending.len();
         // Drain for one probe period, crediting every answer that names a
         // pending key.
         let round_end = std::time::Instant::now() + Duration::from_millis(probe_ms);
@@ -594,6 +654,13 @@ pub async fn read(
     }
     Ok(())
 }
+
+/// How many probes one round may have outstanding.
+///
+/// Not a tuning knob: it is the bound that stops the reader out-sending what
+/// the node answers. A GET for a key nobody holds may never be answered, so
+/// the outstanding count is not self-limiting and something has to limit it.
+const BURST: usize = 32;
 
 /// One bounded GET. `Some(len)` when this node served the state.
 /// `bound` is how long to wait for the ANSWER, not for the send.
