@@ -3,6 +3,7 @@
 
 mod bag;
 mod group;
+mod hedge;
 mod kill9;
 mod latency;
 mod pack;
@@ -286,6 +287,37 @@ enum Cmd {
         #[arg(long, default_value_t = 10)]
         n_control: usize,
         #[arg(long, default_value_t = 3600)]
+        budget_secs: u64,
+    },
+    /// Does re-putting a block make its acknowledgement arrive sooner? The
+    /// hedged re-put of freenet-harness#11, with its no-hedge control
+    /// interleaved and both sides of the trade in one table.
+    Hedge {
+        #[arg(long, default_value = "../freenet-contracts/build/block.wasm")]
+        wasm: String,
+        #[arg(long)]
+        expect_sha: String,
+        #[arg(long, default_value_t = 4096)]
+        size: usize,
+        /// When to hedge, in milliseconds. One arm each, plus the control.
+        #[arg(long, value_delimiter = ',', default_values_t = [2000u64, 5000, 10000])]
+        ts_ms: Vec<u64>,
+        /// Stop once every T has this many CONDITIONED trials on both sides —
+        /// hedges actually fired, and control trials in the same state at the
+        /// same instant. Sizing by rounds leaves about three per T on a
+        /// one-in-ten tail, which can show neither outcome.
+        #[arg(long, default_value_t = 12)]
+        target_conditioned: usize,
+        /// Below this many conditioned trials a row says "no finding".
+        #[arg(long, default_value_t = 5)]
+        min_report: usize,
+        /// Cap, so a condition with no tail cannot run forever.
+        #[arg(long, default_value_t = 400)]
+        max_rounds: usize,
+        /// Deadline for one trial; what is not back by then is `not within T`.
+        #[arg(long, default_value_t = 90)]
+        trial_secs: u64,
+        #[arg(long, default_value_t = 2400)]
         budget_secs: u64,
     },
     /// Set contract live-node round trip. Runs in --local.
@@ -819,6 +851,33 @@ async fn main() -> Result<()> {
                     groups,
                     attempt_ms,
                     group_secs,
+                    budget_secs,
+                },
+            )
+            .await?;
+        }
+        Cmd::Hedge {
+            wasm,
+            expect_sha,
+            size,
+            ts_ms,
+            target_conditioned,
+            min_report,
+            max_rounds,
+            trial_secs,
+            budget_secs,
+        } => {
+            hedge::run(
+                &ws,
+                hedge::Opts {
+                    wasm,
+                    expect_sha,
+                    size,
+                    ts_ms,
+                    target_conditioned,
+                    min_report,
+                    max_rounds,
+                    trial_secs,
                     budget_secs,
                 },
             )
