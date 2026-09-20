@@ -8,6 +8,10 @@ description = "Drives a real Freenet node: deploys contracts, round-trips state,
 
 [dependencies]
 craftec-block-contract = { path = "../freenet-contracts/block", default-features = false }
+# Pinned to the SAME rev the Block contract uses. A second copy of the tree
+# library would give the harness its own block ids, and a pack ordered by those
+# ids is a pack the contract refuses for a reason the run could not see.
+freenet-prolly = { git = "https://github.com/craft-ec/freenet-prolly", rev = "e2756c8" }
 # The Bag's own wire code and mining helpers: the harness must not have a
 # second opinion about the format it is testing.
 craftec-bag-contract = { path = "../freenet-contracts/bag", default-features = false, features = ["testing"] }

@@ -553,6 +553,7 @@ dependencies = [
  "craftec-block-contract",
  "craftec-register-contract",
  "craftec-set-contract",
+ "freenet-prolly",
  "freenet-stdlib",
  "getrandom 0.2.17",
  "sha2",
@@ -574,7 +575,7 @@ dependencies = [
 [[package]]
 name = "freenet-prolly"
 version = "0.1.0"
-source = "git+https://github.com/craft-ec/freenet-prolly?rev=ebbc34f#ebbc34fba8403798dba153219137562745e5d8b7"
+source = "git+https://github.com/craft-ec/freenet-prolly?rev=e2756c8#e2756c850b49994086d2b8b59bb67569d37acc71"
 dependencies = [
  "blake3",
 ]
