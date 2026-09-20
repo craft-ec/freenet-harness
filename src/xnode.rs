@@ -227,6 +227,7 @@ pub async fn put_minted(
     let mut trials: Vec<T> = Vec::with_capacity(expected);
     let mut to_send = 0usize;
     let mut last_beat = std::time::Instant::now();
+    let mut stopped_at_milestone = false;
 
     // Phase 2: ONE loop for the three things that are all happening at once —
     // acknowledgements arriving, the hedge's instant coming round, and the
@@ -429,6 +430,7 @@ pub async fn put_minted(
                 trials.len(),
                 plan.len()
             ));
+            stopped_at_milestone = true;
             break;
         }
 
@@ -444,34 +446,57 @@ pub async fn put_minted(
     // Phase 3: one line per trial, with everything the pairing needs.
     let mut confirmed_n = 0usize;
     for t in &trials {
-        match t.confirm_ms {
-            Some(ms) => {
-                confirmed_n += 1;
-                println!(
-                    "PUT {} {} {:.1} {} {} {} {} {}",
-                    t.key.id(),
-                    t.sent_ns,
-                    ms,
-                    t.size,
-                    t.arm.as_str(),
-                    match t.unacked_at_t {
-                        Some(true) => "unacked",
-                        Some(false) => "acked",
-                        None => "-",
-                    },
-                    if t.hedged { "hedged" } else { "-" },
-                    t.ack_ms.map(|a| format!("{a:.1}")).unwrap_or("-".into()),
-                );
-            }
-            None => println!(
-                "# not readable on the writer within the budget: {}",
-                t.key.id()
-            ),
+        // A line for EVERY trial that was sent, whether or not the WRITER
+        // could read it back. The measurement this run exists for is the far
+        // node's, and it does not need the writer's confirmation — dropping
+        // the unconfirmed ones threw away 58 of 122 trials, including most of
+        // the conditioned population the run had just been stopped for.
+        if t.confirm_ms.is_some() {
+            confirmed_n += 1;
+        }
+        {
+            let ms = t.confirm_ms;
+            println!(
+                "PUT {} {} {} {} {} {} {} {}",
+                t.key.id(),
+                t.sent_ns,
+                // "-" rather than a number: the writer never served it
+                // within the run. That is a fact about the writer, and it
+                // must not be confused with 0 ms.
+                ms.map(|v| format!("{v:.1}")).unwrap_or("-".into()),
+                t.size,
+                t.arm.as_str(),
+                match t.unacked_at_t {
+                    Some(true) => "unacked",
+                    Some(false) => "acked",
+                    None => "-",
+                },
+                if t.hedged { "hedged" } else { "-" },
+                t.ack_ms.map(|a| format!("{a:.1}")).unwrap_or("-".into()),
+            );
         }
     }
 
-    if let Err(e) = stimulus_ok(expected, trials.len(), confirmed_n) {
+    // The stimulus assertion asks "did the run send what it set out to send".
+    // With a milestone, what it set out to do was REACH THE MILESTONE, and
+    // stopping short of the plan is the feature — so the expectation is what
+    // was sent. Left as the plan, this assertion killed a run that had just
+    // reported hitting its milestone.
+    let intended = if stopped_at_milestone {
+        trials.len()
+    } else {
+        expected
+    };
+    if let Err(e) = stimulus_ok(intended, trials.len(), confirmed_n) {
         bail!("{e}");
+    }
+    if stopped_at_milestone {
+        println!(
+            "# stopped at the milestone: {} of {} planned trials sent, which is the point — \
+             the run collected the conditioned population it needed and stopped.",
+            trials.len(),
+            expected
+        );
     }
 
     let acked = trials.iter().filter(|t| t.ack_ms.is_some()).count();
@@ -850,7 +875,10 @@ impl Arm {
 pub struct Send {
     pub key: String,
     pub sent_ns: u128,
-    pub confirm_ms: f64,
+    /// When the WRITER could first read it back, if it ever could. `None` is
+    /// "the writer never served it within the run" — a different fact from
+    /// 0 ms, and the parser must not collapse them.
+    pub confirm_ms: Option<f64>,
     pub size: usize,
     pub arm: Arm,
     /// Was this trial still unacknowledged when T came round? Taken in BOTH
@@ -1096,7 +1124,7 @@ pub fn pair_files(put_file: &str, read_file: &str, margin_ms: f64, grid_ms: f64)
             (f.first() == Some(&"PUT") && f.len() >= 5).then(|| Send {
                 key: f[1].to_string(),
                 sent_ns: f[2].parse().unwrap_or(0),
-                confirm_ms: f[3].parse().unwrap_or(0.0),
+                confirm_ms: f[3].parse().ok(),
                 size: f[4].parse().unwrap_or(0),
                 // Absent in a file written before arms existed, which is a
                 // run with no hedge: all control, no mark, nothing fired.
@@ -1359,7 +1387,7 @@ mod tests {
         Send {
             key: key.into(),
             sent_ns,
-            confirm_ms: 100.0,
+            confirm_ms: Some(100.0),
             size: 1024,
             arm: Arm::Control,
             unacked_at_t: None,
