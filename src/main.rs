@@ -4,6 +4,7 @@
 mod bag;
 mod latency;
 mod register;
+mod set;
 mod stats;
 mod validate_cost;
 mod wasm_check;
@@ -146,6 +147,13 @@ enum Cmd {
     /// Register contract live-node round trip. Runs in --local.
     Register {
         #[arg(long, default_value = "../freenet-contracts/build/register.wasm")]
+        wasm: String,
+        #[arg(long)]
+        expect_sha: Option<String>,
+    },
+    /// Set contract live-node round trip. Runs in --local.
+    Set {
+        #[arg(long, default_value = "../freenet-contracts/build/set.wasm")]
         wasm: String,
         #[arg(long)]
         expect_sha: Option<String>,
@@ -596,6 +604,9 @@ async fn main() -> Result<()> {
         }
         Cmd::Register { wasm, expect_sha } => {
             register::run(&ws, &wasm, expect_sha.as_deref(), wait).await?;
+        }
+        Cmd::Set { wasm, expect_sha } => {
+            set::run(&ws, &wasm, expect_sha.as_deref(), wait).await?;
         }
         Cmd::Watch { key, secs } => {
             watch::run(&ws, &key, secs, wait).await?;

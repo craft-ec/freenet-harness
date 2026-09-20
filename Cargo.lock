@@ -314,6 +314,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "craftec-set-contract"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "ed25519-dalek",
+ "freenet-stdlib",
+]
+
+[[package]]
 name = "crypto-common"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -543,6 +552,7 @@ dependencies = [
  "craftec-bag-contract",
  "craftec-block-contract",
  "craftec-register-contract",
+ "craftec-set-contract",
  "freenet-stdlib",
  "getrandom 0.2.17",
  "sha2",
