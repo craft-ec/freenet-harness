@@ -3,6 +3,7 @@
 
 mod bag;
 mod group;
+mod hedge;
 mod kill9;
 mod latency;
 mod pack;
@@ -286,6 +287,28 @@ enum Cmd {
         #[arg(long, default_value_t = 10)]
         n_control: usize,
         #[arg(long, default_value_t = 3600)]
+        budget_secs: u64,
+    },
+    /// Does re-putting a block make its acknowledgement arrive sooner? The
+    /// hedged re-put of freenet-harness#11, with its no-hedge control
+    /// interleaved and both sides of the trade in one table.
+    Hedge {
+        #[arg(long, default_value = "../freenet-contracts/build/block.wasm")]
+        wasm: String,
+        #[arg(long)]
+        expect_sha: String,
+        #[arg(long, default_value_t = 4096)]
+        size: usize,
+        /// When to hedge, in milliseconds. One arm each, plus the control.
+        #[arg(long, value_delimiter = ',', default_values_t = [2000u64, 5000, 10000])]
+        ts_ms: Vec<u64>,
+        /// Rounds. Every arm gets round r before any arm gets round r+1.
+        #[arg(long, default_value_t = 30)]
+        n: usize,
+        /// Deadline for one trial; what is not back by then is `not within T`.
+        #[arg(long, default_value_t = 90)]
+        trial_secs: u64,
+        #[arg(long, default_value_t = 2400)]
         budget_secs: u64,
     },
     /// Set contract live-node round trip. Runs in --local.
@@ -819,6 +842,29 @@ async fn main() -> Result<()> {
                     groups,
                     attempt_ms,
                     group_secs,
+                    budget_secs,
+                },
+            )
+            .await?;
+        }
+        Cmd::Hedge {
+            wasm,
+            expect_sha,
+            size,
+            ts_ms,
+            n,
+            trial_secs,
+            budget_secs,
+        } => {
+            hedge::run(
+                &ws,
+                hedge::Opts {
+                    wasm,
+                    expect_sha,
+                    size,
+                    ts_ms,
+                    n,
+                    trial_secs,
                     budget_secs,
                 },
             )
