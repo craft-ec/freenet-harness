@@ -231,29 +231,73 @@ pub fn parse_groups(path: &str) -> Result<Vec<Block>> {
     // (F20) was paid once PER GROUP: 64 of 240 groups paid it in full and one
     // run took 80 minutes for ~10 minutes of work. A batch should pay a tail
     // once, not N times.
-    let bound_ms = text
-        .lines()
-        .find_map(|l| l.strip_prefix("# ack-bound-ms "))
-        .and_then(|v| v.trim().parse::<f64>().ok())
-        .unwrap_or(30_000.0);
-    let mut acks: HashMap<String, f64> = HashMap::new();
-    for l in text.lines() {
-        let f: Vec<&str> = l.split_whitespace().collect();
-        if f.len() >= 3 && f[0] == "ACK" {
-            if let Ok(ms) = f[2].parse::<f64>() {
-                // Keep the FIRST ack for a key: a duplicate is the same answer
-                // seen twice, not a later one.
-                acks.entry(f[1].to_string()).or_insert(ms);
+    // TWO FORMATS, and the file says which it is.
+    //
+    // Files written before the one-pass writer carry each block's outcome in
+    // its own record and use `ACK` lines only as corrections — and, because of
+    // an O(n^2) emitter since removed, they repeat those corrections once per
+    // subsequent group (one key in condition B's file has 238 of them). Files
+    // written after it carry `# ack-bound-ms` and put the outcome ONLY in the
+    // ACK lines.
+    //
+    // A parser that assumed the new shape read the old one as 3 late and 79
+    // never where the run had recorded 82 late — a silent re-interpretation of
+    // real measured data. So the format is DETECTED, not assumed, and the
+    // choice is printed: a reader who sees a number change should be able to
+    // see why.
+    let new_format = text.lines().any(|l| l.starts_with("# ack-bound-ms "));
+    if new_format {
+        let bound_ms = text
+            .lines()
+            .find_map(|l| l.strip_prefix("# ack-bound-ms "))
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .unwrap_or(30_000.0);
+        let mut acks: HashMap<String, f64> = HashMap::new();
+        for l in text.lines() {
+            let f: Vec<&str> = l.split_whitespace().collect();
+            if f.len() >= 3 && f[0] == "ACK" {
+                if let Ok(ms) = f[2].parse::<f64>() {
+                    // The FIRST ack for a key is the answer; a repeat is the
+                    // same answer seen twice, not a later one.
+                    acks.entry(f[1].to_string()).or_insert(ms);
+                }
+            }
+        }
+        for b in out.iter_mut() {
+            b.ack = match acks.get(&b.key) {
+                Some(ms) if *ms <= bound_ms => Ack::Within(*ms),
+                Some(ms) => Ack::Late(*ms),
+                None => Ack::Never,
+            };
+        }
+    } else {
+        // Old format: the record carries the outcome KNOWN WHEN ITS GROUP
+        // CLOSED, and an ack arriving later was appended as a correction. So
+        // the truth needs BOTH — the field, with corrections folded onto the
+        // records that said `Never`.
+        //
+        // Ignoring the corrections is as wrong as ignoring the field: it reads
+        // condition B as 79 never-acked where the run recorded 82 late. A
+        // correction is by definition LATE, because it exists only because the
+        // key's own window had already closed.
+        let mut corrections: HashMap<String, f64> = HashMap::new();
+        for l in text.lines() {
+            let f: Vec<&str> = l.split_whitespace().collect();
+            if f.len() >= 3 && f[0] == "ACK" {
+                if let Ok(ms) = f[2].parse::<f64>() {
+                    corrections.entry(f[1].to_string()).or_insert(ms);
+                }
+            }
+        }
+        for b in out.iter_mut() {
+            if matches!(b.ack, Ack::Never) {
+                if let Some(ms) = corrections.get(&b.key) {
+                    b.ack = Ack::Late(*ms);
+                }
             }
         }
     }
-    for b in out.iter_mut() {
-        b.ack = match acks.get(&b.key) {
-            Some(ms) if *ms <= bound_ms => Ack::Within(*ms),
-            Some(ms) => Ack::Late(*ms),
-            None => Ack::Never,
-        };
-    }
+
     Ok(out)
 }
 
@@ -1289,4 +1333,81 @@ pub async fn reput(
     save_probe(&client, out, "the re-put");
     let _ = client.send(ClientRequest::Disconnect { cause: None }).await;
     Ok(())
+}
+
+#[cfg(test)]
+mod format_tests {
+    use super::*;
+
+    /// A file written by the OLD writer must still read as the run recorded it.
+    ///
+    /// This is not hypothetical. Condition B's 2,960-block file is in that
+    /// format, and a parser that assumed the new one read it as 79 never-acked
+    /// where the run had recorded 82 late — a silent re-interpretation of real
+    /// measured data, with no error and no warning.
+    ///
+    /// The old shape needs BOTH: each record carries the outcome known when its
+    /// group closed, and an ack arriving afterwards was appended as a
+    /// correction. Using only one of the two is wrong in one direction or the
+    /// other.
+    #[test]
+    fn an_old_format_file_still_reads_as_the_run_recorded_it() {
+        let dir = std::env::temp_dir().join(format!("parity-fmt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("old.txt");
+        // No `# ack-bound-ms` header: that absence IS the format marker.
+        // One block acked in its own window, one that was not and was
+        // corrected later, one never acked at all. Corrections are repeated,
+        // as the old O(n^2) emitter repeated them.
+        std::fs::write(
+            &path,
+            "GROUP 0 1 full BLOCK 0 data KEYA 1 12.5 1025 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n\
+             GROUP 0 1 full BLOCK 1 data KEYB 2 NEVER 1025 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n\
+             GROUP 0 1 full BLOCK 2 parity KEYC 3 NEVER 1025 cccccccccccccccccccccccccccccccc\n\
+             ACK KEYB 45000.0\n\
+             ACK KEYB 45000.0\n\
+             ACK KEYB 45000.0\n",
+        )
+        .unwrap();
+
+        let got = parse_groups(path.to_str().unwrap()).unwrap();
+        assert_eq!(got.len(), 3);
+        assert!(matches!(got[0].ack, Ack::Within(_)), "{:?}", got[0].ack);
+        assert!(
+            matches!(got[1].ack, Ack::Late(_)),
+            "a corrected record is LATE, not never: {:?}",
+            got[1].ack
+        );
+        assert!(
+            matches!(got[2].ack, Ack::Never),
+            "and one with no correction stays never: {:?}",
+            got[2].ack
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A new-format file takes its outcomes from the ACK lines alone, against
+    /// the bound the file itself records.
+    #[test]
+    fn a_new_format_file_is_read_by_its_own_recorded_bound() {
+        let dir = std::env::temp_dir().join(format!("parity-fmt2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("new.txt");
+        std::fs::write(
+            &path,
+            "# ack-bound-ms 30000\n\
+             GROUP 0 1 full BLOCK 0 data KEYA 1 NEVER 1025 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n\
+             GROUP 0 1 full BLOCK 1 data KEYB 2 NEVER 1025 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n\
+             GROUP 0 1 full BLOCK 2 parity KEYC 3 NEVER 1025 cccccccccccccccccccccccccccccccc\n\
+             ACK KEYA 12.5\n\
+             ACK KEYB 45000.0\n",
+        )
+        .unwrap();
+
+        let got = parse_groups(path.to_str().unwrap()).unwrap();
+        assert!(matches!(got[0].ack, Ack::Within(_)), "{:?}", got[0].ack);
+        assert!(matches!(got[1].ack, Ack::Late(_)), "{:?}", got[1].ack);
+        assert!(matches!(got[2].ack, Ack::Never), "{:?}", got[2].ack);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
