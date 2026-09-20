@@ -220,6 +220,40 @@ pub fn parse_groups(path: &str) -> Result<Vec<Block>> {
     if out.is_empty() {
         bail!("{path}: no GROUP lines — the write role wrote nothing");
     }
+    // Fold the acks. A record is appended the moment its block is SENT, with
+    // its outcome unknown; every acknowledgement is then appended as its own
+    // `ACK <key> <ms>` line whenever it arrives. So the file is append-only,
+    // nothing is ever rewritten, and a run that dies mid-way leaves everything
+    // before that point intact and readable.
+    //
+    // It also means the writer never has to WAIT for a group before starting
+    // the next. The old shape waited per group, so the relay's flat ~60 s tail
+    // (F20) was paid once PER GROUP: 64 of 240 groups paid it in full and one
+    // run took 80 minutes for ~10 minutes of work. A batch should pay a tail
+    // once, not N times.
+    let bound_ms = text
+        .lines()
+        .find_map(|l| l.strip_prefix("# ack-bound-ms "))
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .unwrap_or(30_000.0);
+    let mut acks: HashMap<String, f64> = HashMap::new();
+    for l in text.lines() {
+        let f: Vec<&str> = l.split_whitespace().collect();
+        if f.len() >= 3 && f[0] == "ACK" {
+            if let Ok(ms) = f[2].parse::<f64>() {
+                // Keep the FIRST ack for a key: a duplicate is the same answer
+                // seen twice, not a later one.
+                acks.entry(f[1].to_string()).or_insert(ms);
+            }
+        }
+    }
+    for b in out.iter_mut() {
+        b.ack = match acks.get(&b.key) {
+            Some(ms) if *ms <= bound_ms => Ack::Within(*ms),
+            Some(ms) => Ack::Late(*ms),
+            None => Ack::Never,
+        };
+    }
     Ok(out)
 }
 
@@ -238,6 +272,50 @@ fn save_probe(client: &crate::probe::Client, out: &str, what: &'static str) {
     match std::fs::write(&path, client.dump(what)) {
         Ok(()) => println!("# probe recording: {path}"),
         Err(e) => println!("# probe recording could NOT be written to {path}: {e}"),
+    }
+}
+
+/// Consume whatever acknowledgements are available, filing each under its own
+/// key and appending it to the file as it arrives.
+///
+/// `per_recv` is how long to wait for the NEXT one: `ZERO` drains what is
+/// already there without blocking (used between groups, so the socket never
+/// backpressures on a connection nobody is reading), and a real duration waits
+/// for stragglers (used once at the end, for the tail).
+///
+/// Returns `false` only if the connection itself ended.
+async fn drain_acks(
+    client: &mut crate::probe::Client,
+    sent_at: &HashMap<String, std::time::Instant>,
+    acked: &mut std::collections::HashSet<String>,
+    ack_ms: &mut HashMap<String, f64>,
+    sink: &mut impl std::io::Write,
+    per_recv: Duration,
+    want: usize,
+) -> Result<bool> {
+    loop {
+        if acked.len() >= want {
+            return Ok(true);
+        }
+        match timeout(per_recv, client.recv()).await {
+            Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key }))) => {
+                let k = key.id().to_string();
+                if let Some(t) = sent_at.get(&k) {
+                    // The FIRST ack for a key is the answer; a repeat is the
+                    // same answer seen twice, not a later one.
+                    if acked.insert(k.clone()) {
+                        let ms = t.elapsed().as_secs_f64() * 1000.0;
+                        ack_ms.insert(k.clone(), ms);
+                        writeln!(sink, "ACK {k} {ms:.1}")?;
+                    }
+                }
+            }
+            Ok(Ok(_)) => {}
+            Ok(Err(_)) => return Ok(false),
+            // Nothing more within the bound. Not an error: with ZERO this is
+            // the normal exit from an opportunistic drain.
+            Err(_) => return Ok(true),
+        }
     }
 }
 
@@ -295,63 +373,50 @@ pub async fn write(
     );
     println!("# a group is one CONCURRENT batch: every member is sent before any ack is read");
 
-    // WHOLE-RUN bookkeeping, and that is the correction this carries.
+    // ONE PASS, and the tail paid ONCE.
     //
-    // The first version kept a per-group ack map and stopped once it held as
-    // many entries as the group had members. When one of a group's own acks
-    // was slow the loop kept reading and filled the quota with LATE ACKS
-    // BELONGING TO EARLIER GROUPS — the count reached n, the loop exited
-    // satisfied, and this group's keys were written down NEVER while the
-    // printed line said 15/15. One 240-group run printed 99.5% acked against a
-    // per-key truth of 92.1%, and the per-key column was biased too, because a
-    // group's own ack arriving after its window had closed was filed nowhere.
+    // The shape this replaces waited for each group's acknowledgements before
+    // starting the next, so the relay's flat ~60 s wait (F20) was paid once
+    // PER GROUP — 64 of 240 groups paid it in full and a run that is ~10
+    // minutes of work took 80. The repo's own rule says a batch should pay a
+    // tail once, not N times; this now follows it.
     //
-    // A count is not a pairing — the same defect as harness#38, one layer up.
-    // So: an ack is filed under its OWN key whenever it turns up, each group
-    // waits for ITS OWN keys, and every key's outcome is decided at the end
-    // from its own send instant.
-    let mut acked: HashMap<String, std::time::Instant> = HashMap::new();
-    let mut sent: Vec<(Block, std::time::Instant)> = Vec::new();
+    // So: every group is sent back to back, acknowledgements are drained
+    // opportunistically between sends (never blocking, and never between the
+    // sends of ONE group — that would throw away the answers to the members
+    // asked first), and the tail is paid once at the end.
+    //
+    // The file is append-only. A block's record is written the moment it is
+    // SENT, with its outcome unknown; each acknowledgement is appended as its
+    // own `ACK <key> <ms>` line as it arrives. Nothing is ever rewritten, so a
+    // run that dies leaves every completed group readable, and the parser
+    // decides each key's outcome from its own ack time against the recorded
+    // bound.
+    let mut sink = std::io::BufWriter::new(std::fs::File::create(out)?);
+    writeln!(sink, "# ack-bound-ms {}", ack_secs * 1000)?;
+    let mut sent_at: HashMap<String, std::time::Instant> = HashMap::new();
+    let mut acked: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut ack_ms: HashMap<String, f64> = HashMap::new();
+    let mut n_blocks = 0usize;
 
     let started = std::time::Instant::now();
     let budget = Duration::from_secs(budget_mins * 60);
     let mut done: HashMap<(usize, Arm), usize> = HashMap::new();
-    let mut last_progress = std::time::Instant::now();
-    let mut relay_notes_total = 0usize;
 
     for (gid, &(m, arm)) in plan.iter().enumerate() {
         if started.elapsed() >= budget {
-            println!(
-                "# BUDGET {budget_mins} min reached after {gid} group(s) — reporting what exists"
-            );
+            println!("# BUDGET {budget_mins} min reached after {gid} group(s)");
             break;
         }
-        // A stall is a SHORT timeout on PROGRESS, never a long one on the run.
-        // The relay tail is ~60 s, so three of them with nothing finishing is a
-        // wedge rather than a slow link.
-        if last_progress.elapsed() >= Duration::from_secs(180) {
-            println!("# STALL: no group completed for 180 s — stopping at {gid} group(s)");
-            break;
-        }
-
         let n = m + parity;
-        let mut minted = Vec::with_capacity(n);
+        let t0 = std::time::Instant::now();
         for idx in 0..n {
             let mut seed = [0u8; 16];
             getrandom::getrandom(&mut seed)?;
             let (contract, state) = mint_seeded(&code, &seed, size);
-            let key = contract.key();
-            minted.push((idx, idx >= m, contract, state, key, seed));
-        }
-
-        // Every send first. No recv in this loop: draining between the sends of
-        // one concurrent batch throws away the answers to the members asked
-        // first.
-        let t0 = std::time::Instant::now();
-        let mut want: Vec<String> = Vec::with_capacity(n);
-        for (idx, is_parity, contract, state, key, seed) in minted {
+            let key = contract.key().id().to_string();
             let t_send = now_ns();
-            let label = send_req(
+            let _ = send_req(
                 &mut client,
                 ClientRequest::ContractOp(ContractRequest::Put {
                     contract,
@@ -363,116 +428,92 @@ pub async fn write(
                 Duration::from_secs(ack_secs),
             )
             .await?;
-            let key = key.id().to_string();
-            want.push(key.clone());
-            sent.push((
+            sent_at.insert(key.clone(), std::time::Instant::now());
+            n_blocks += 1;
+            writeln!(
+                sink,
+                "{}",
                 Block {
                     seed,
                     gid,
                     m,
                     arm,
                     idx,
-                    parity: is_parity,
+                    parity: idx >= m,
                     key,
                     t_send,
-                    // Filled in at the end, from this key's own send instant.
                     ack: Ack::Never,
                     size: state.len(),
-                },
-                std::time::Instant::now(),
-            ));
-            let _ = label;
-        }
-
-        // Wait for THIS GROUP'S keys, not for a count.
-        let deadline = std::time::Instant::now() + Duration::from_secs(2 * ack_secs);
-        let mut relay_notes = 0usize;
-        while !want.iter().all(|k| acked.contains_key(k)) {
-            let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) else {
-                break;
-            };
-            match timeout(left, client.recv()).await {
-                Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key }))) => {
-                    // Filed under its OWN key, whichever group it belongs to.
-                    acked
-                        .entry(key.id().to_string())
-                        .or_insert_with(std::time::Instant::now);
                 }
-                Ok(Ok(_)) => {}
-                // The relay's own text arrives on a response carrying no key,
-                // so it cannot be attributed to a member. Counted per group.
-                Ok(Err(_)) => relay_notes += 1,
-                Err(_) => break,
-            }
+                .line()
+            )?;
         }
-        relay_notes_total += relay_notes;
-
-        let got = want.iter().filter(|k| acked.contains_key(*k)).count();
-        let c = done.entry((m, arm)).or_insert(0);
-        *c += 1;
-        last_progress = std::time::Instant::now();
+        // Between GROUPS, never between the sends of one: drain whatever is
+        // already waiting, without blocking. This keeps the socket from
+        // backpressuring on a connection nobody is reading.
+        drain_acks(
+            &mut client,
+            &sent_at,
+            &mut acked,
+            &mut ack_ms,
+            &mut sink,
+            Duration::ZERO,
+            n_blocks,
+        )
+        .await?;
+        sink.flush()?;
+        *done.entry((m, arm)).or_insert(0) += 1;
         println!(
-            "# group {gid} m={m} {} — {got}/{n} of ITS OWN keys acked, {:.1} s{}, {}",
+            "# group {gid} m={m} {} sent in {:.1} s — {} acked so far of {n_blocks}, {}",
             arm.tag(),
             t0.elapsed().as_secs_f64(),
-            if relay_notes > 0 {
-                format!(", {relay_notes} keyless error response(s)")
-            } else {
-                String::new()
-            },
+            acked.len(),
             client.line()
         );
     }
 
-    // One last drain: an ack that arrives after its group's window has closed
-    // still belongs to its key, and throwing it away would report a write as
-    // unacknowledged when the node had answered.
-    let drain_until = std::time::Instant::now() + Duration::from_secs(ack_secs);
-    while std::time::Instant::now() < drain_until {
-        let Some(left) = drain_until.checked_duration_since(std::time::Instant::now()) else {
+    // The tail, once. Everything is already on the wire, so this waits for
+    // stragglers rather than for work.
+    println!(
+        "# all sent; draining acknowledgements for up to {} s",
+        2 * ack_secs
+    );
+    let tail = std::time::Instant::now() + Duration::from_secs(2 * ack_secs);
+    while acked.len() < n_blocks {
+        let Some(left) = tail.checked_duration_since(std::time::Instant::now()) else {
             break;
         };
-        match timeout(left, client.recv()).await {
-            Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key }))) => {
-                acked
-                    .entry(key.id().to_string())
-                    .or_insert_with(std::time::Instant::now);
-            }
-            Ok(Ok(_)) | Ok(Err(_)) => {}
-            Err(_) => break,
+        let step = left.min(Duration::from_secs(5));
+        if !drain_acks(
+            &mut client,
+            &sent_at,
+            &mut acked,
+            &mut ack_ms,
+            &mut sink,
+            step,
+            n_blocks,
+        )
+        .await?
+        {
+            break;
+        }
+        if acked.len() >= n_blocks {
+            break;
         }
     }
-
-    // Now every key's outcome, from ITS OWN send instant.
-    let mut sink = std::io::BufWriter::new(std::fs::File::create(out)?);
-    let bound = Duration::from_secs(ack_secs);
-    let (mut within_n, mut late_n, mut never_n) = (0usize, 0usize, 0usize);
-    for (mut b, sent_at) in sent {
-        b.ack = match acked.get(&b.key) {
-            Some(at) => {
-                let d = at.saturating_duration_since(sent_at);
-                if d <= bound {
-                    within_n += 1;
-                    Ack::Within(d.as_secs_f64() * 1000.0)
-                } else {
-                    late_n += 1;
-                    Ack::Late(d.as_secs_f64() * 1000.0)
-                }
-            }
-            None => {
-                never_n += 1;
-                Ack::Never
-            }
-        };
-        writeln!(sink, "{}", b.line())?;
-    }
-    if relay_notes_total > 0 {
-        writeln!(
-            sink,
-            "# NOTE: {relay_notes_total} keyless error response(s) over the run"
-        )?;
-    }
     sink.flush()?;
+    let (within_n, late_n, never_n) = {
+        let bound_ms = (ack_secs * 1000) as f64;
+        let mut w = 0usize;
+        let mut l = 0usize;
+        for k in &acked {
+            match ack_ms.get(k) {
+                Some(ms) if *ms <= bound_ms => w += 1,
+                _ => l += 1,
+            }
+        }
+        (w, l, n_blocks - acked.len())
+    };
 
     // THE INVARIANT, asserted rather than trusted.
     //
