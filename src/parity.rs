@@ -306,9 +306,10 @@ async fn drain_acks(
         match timeout(per_recv, client.recv()).await {
             Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key }))) => {
                 let k = key.id().to_string();
-                // The answer NAMED itself, so it closes the operation that
-                // asked for THIS key — whatever else is outstanding.
-                client.answered(&k);
+                // The pairing already happened, in `Client::recv`: an answer
+                // that names itself is matched at the BOUNDARY, not here.
+                // Calling `answered` again would record the same answer twice
+                // and the recording would rightly report `Twice`.
                 if let Some(t) = sent_at.get(&k) {
                     if let std::collections::hash_map::Entry::Vacant(e) = ack_ms.entry(k.clone()) {
                         let ms = t.elapsed().as_secs_f64() * 1000.0;
