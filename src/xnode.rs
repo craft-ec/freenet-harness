@@ -95,13 +95,29 @@ fn mint(code: &Arc<ContractCode<'static>>, size: usize) -> Result<(ContractConta
 /// must travel over the same link the block is propagating on, and the block
 /// wins. Minting first lets the reader prove the key is cold and be already
 /// polling when the write happens.
-pub async fn mint_only(wasm: &str, samples: usize, sizes: &[usize], out: &str) -> Result<()> {
+pub async fn mint_only(
+    wasm: &str,
+    samples: usize,
+    sizes: &[usize],
+    out: &str,
+    arms: bool,
+) -> Result<()> {
     let code = Arc::new(ContractCode::from(std::fs::read(wasm).map_err(|e| {
         anyhow!("{wasm}: {e} — run ../freenet-contracts/build.sh first")
     })?));
     let mut f = String::new();
+    let mut n = 0usize;
     for &size in sizes {
         for _ in 0..samples {
+            // Interleaved, not blocked: two arms run one after the other are
+            // two runs under two sets of conditions, and on a hotspot the
+            // conditions are the thing that moves.
+            let arm = if arms && n % 2 == 1 {
+                Arm::Hedge
+            } else {
+                Arm::Control
+            };
+            n += 1;
             let mut seed = [0u8; 16];
             getrandom::getrandom(&mut seed)?;
             let body = body_from_seed(&seed, size);
@@ -112,19 +128,26 @@ pub async fn mint_only(wasm: &str, samples: usize, sizes: &[usize], out: &str) -
                 params,
             )))
             .key();
-            // key, body size, seed — the put phase regenerates identical bytes.
+            // key, body size, seed, arm — the put phase regenerates identical
+            // bytes and inherits the assignment rather than making one.
             f.push_str(&format!(
-                "MINT {} {} {}\n",
+                "MINT {} {} {} {}\n",
                 key.id(),
                 size,
-                seed.iter().map(|b| format!("{b:02x}")).collect::<String>()
+                seed.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+                arm.as_str()
             ));
         }
     }
     std::fs::write(out, f)?;
     println!(
-        "# minted {} blocks to {out} (nothing put yet)",
-        samples * sizes.len()
+        "# minted {} blocks to {out} (nothing put yet){}",
+        samples * sizes.len(),
+        if arms {
+            ", interleaved control/hedge"
+        } else {
+            ", all control"
+        }
     );
     Ok(())
 }
@@ -142,7 +165,13 @@ pub async fn mint_only(wasm: &str, samples: usize, sizes: &[usize], out: &str) -
 /// The ack is still collected, on its own connection-draining pass with its
 /// own deadline, and reported as its own column. Not measuring it would trade
 /// one blind spot for another.
-pub async fn put_minted(ws: &str, wasm: &str, minted: &str, wait: Duration) -> Result<()> {
+pub async fn put_minted(
+    ws: &str,
+    wasm: &str,
+    minted: &str,
+    hedge: Option<Duration>,
+    wait: Duration,
+) -> Result<()> {
     let code = Arc::new(ContractCode::from(std::fs::read(wasm)?));
     let text = std::fs::read_to_string(minted)
         .map_err(|e| anyhow!("{minted}: {e} — run the mint role first"))?;
@@ -150,12 +179,33 @@ pub async fn put_minted(ws: &str, wasm: &str, minted: &str, wait: Duration) -> R
     // A second connection, so a read-back cannot be answered by the put's own
     // reply arriving on the same socket.
     let mut confirm = crate::connect(ws).await?;
-    let mut sent: Vec<(ContractInstanceId, String, usize, u128)> = Vec::new();
 
-    // Phase 1: issue EVERY put before confirming any. A batch then pays the
-    // relay tail once rather than N times — sequential put-and-wait is what
-    // made a 21-block run take three minutes.
-    let mut pending: Vec<(ContractKey, usize, u128, std::time::Instant)> = Vec::new();
+    /// One trial's whole life, so the loop below has one place to look.
+    struct T {
+        key: ContractKey,
+        size: usize,
+        seed: [u8; 16],
+        arm: Arm,
+        sent_ns: u128,
+        t0: std::time::Instant,
+        ack_ms: Option<f64>,
+        confirm_ms: Option<f64>,
+        unacked_at_t: Option<bool>,
+        hedged: bool,
+        marked: bool,
+    }
+
+    // The plan: what to send, in order. Nothing is sent here.
+    //
+    // Sending every put BEFORE the loop starts — which is what this role used
+    // to do — makes the hedge unusable at scale. A hedge fires T after its own
+    // trial's send, and the loop that fires it cannot run until the last send
+    // returns: on a hotspot uplink, 200 puts of ~127 KiB each take minutes, so
+    // trial 1's hedge would fire minutes after its T rather than at it, and
+    // the "T" in the table would be a number nothing obeyed. The sends are now
+    // issued BY the loop, one per pass, so each trial's clock starts when its
+    // own bytes go out and the hedges keep their timing.
+    let mut plan: Vec<([u8; 16], usize, Arm)> = Vec::new();
     for line in text.lines() {
         let f: Vec<&str> = line.split_whitespace().collect();
         if f.first() != Some(&"MINT") || f.len() < 4 {
@@ -166,90 +216,205 @@ pub async fn put_minted(ws: &str, wasm: &str, minted: &str, wait: Duration) -> R
         for (i, b) in seed.iter_mut().enumerate() {
             *b = u8::from_str_radix(&f[3][i * 2..i * 2 + 2], 16).unwrap_or(0);
         }
-        let state = block::encode(block::kind::RAW, &body_from_seed(&seed, size));
-        let params = Parameters::from(blake3::hash(&state).as_bytes().to_vec());
-        let contract = ContractContainer::Wasm(ContractWasmAPIVersion::V1(WrappedContract::new(
-            code.clone(),
-            params,
-        )));
-        let key = contract.key();
-        let t_send = now_ns();
-        let t = std::time::Instant::now();
-        send_req(
-            &mut writer,
-            ClientRequest::ContractOp(ContractRequest::Put {
-                contract,
-                state: WrappedState::from(state.clone()),
-                related_contracts: RelatedContracts::default(),
-                subscribe: false,
-                blocking_subscribe: false,
-            }),
-            Duration::from_secs(30),
-        )
-        .await?;
-
-        pending.push((key, size, t_send, t));
-        sent.push((*key.id(), key.id().to_string(), size, t_send));
+        plan.push((
+            seed,
+            size,
+            f.get(4).map(|a| Arm::parse(a)).unwrap_or(Arm::Control),
+        ));
     }
+    let expected = plan.len();
+    let mut trials: Vec<T> = Vec::with_capacity(expected);
+    let mut to_send = 0usize;
 
-    // Phase 2: confirm each by bounded read-back on the OTHER connection, so a
-    // read-back can never be answered by the put's own reply.
-    let mut confirmed_n = 0usize;
-    for (key, size, t_send, t) in &pending {
-        let mut confirmed: Option<f64> = None;
-        let gate = std::time::Instant::now() + Duration::from_secs(2);
-        while std::time::Instant::now() < gate {
-            if probe_once(&mut confirm, key.id(), false, Duration::from_millis(200))
+    // Phase 2: ONE loop for the three things that are all happening at once —
+    // acknowledgements arriving, the hedge's instant coming round, and the
+    // local read-back. Two loops would mean a hedge that cannot fire while a
+    // read-back is waiting, which is a hedge timed by whatever else the loop
+    // was doing rather than by T.
+    let budget = std::time::Instant::now() + wait.min(Duration::from_secs(180));
+    let mut hedged_bytes = 0usize;
+    let mut next = 0usize;
+    while std::time::Instant::now() < budget {
+        // One send per pass, so a trial's clock starts when its own bytes go
+        // out and every hedge below is timed from that instant.
+        if to_send < plan.len() {
+            let (seed, size, arm) = plan[to_send];
+            to_send += 1;
+            let state = block::encode(block::kind::RAW, &body_from_seed(&seed, size));
+            let params = Parameters::from(blake3::hash(&state).as_bytes().to_vec());
+            let contract = ContractContainer::Wasm(ContractWasmAPIVersion::V1(
+                WrappedContract::new(code.clone(), params),
+            ));
+            let key = contract.key();
+            let sent_ns = now_ns();
+            let t0 = std::time::Instant::now();
+            send_req(
+                &mut writer,
+                ClientRequest::ContractOp(ContractRequest::Put {
+                    contract,
+                    state: WrappedState::from(state.clone()),
+                    related_contracts: RelatedContracts::default(),
+                    subscribe: false,
+                    blocking_subscribe: false,
+                }),
+                Duration::from_secs(60),
+            )
+            .await?;
+            trials.push(T {
+                key,
+                size,
+                seed,
+                arm,
+                sent_ns,
+                t0,
+                ack_ms: None,
+                confirm_ms: None,
+                unacked_at_t: None,
+                hedged: false,
+                marked: hedge.is_none(),
+            });
+        }
+
+        // Acknowledgements first: they are what the hedge decision reads, and
+        // an ack sitting unread in the socket is a hedge fired for nothing.
+        while let Ok(Ok(msg)) = timeout(Duration::from_millis(0), writer.recv()).await {
+            if let HostResponse::ContractResponse(ContractResponse::PutResponse { key: k }) = msg {
+                if let Some(t) = trials.iter_mut().find(|t| t.key.id() == k.id()) {
+                    if t.ack_ms.is_none() {
+                        t.ack_ms = Some(ms_since(t.t0));
+                    }
+                }
+            }
+        }
+
+        // The mark is taken in BOTH arms at each trial's own T, so "still
+        // unacknowledged at T" means the same thing on each side of the
+        // comparison. Only the hedge arm acts on it.
+        if let Some(d) = hedge {
+            let now = std::time::Instant::now();
+            // By index, and `trials` is borrowed mutably inside: the body
+            // both reads a trial's state and awaits a send, which an iterator
+            // over `&mut` cannot do while the loop also reads `code`.
+            #[allow(clippy::needless_range_loop)]
+            for i in 0..trials.len() {
+                if trials[i].marked || now < trials[i].t0 + d {
+                    continue;
+                }
+                trials[i].marked = true;
+                let still = trials[i].ack_ms.is_none();
+                trials[i].unacked_at_t = Some(still);
+                if still && trials[i].arm == Arm::Hedge {
+                    // The SAME bytes under the SAME key: re-putting an
+                    // immutable block is idempotent, so this is a second offer
+                    // of one block and not a new block.
+                    let state = block::encode(
+                        block::kind::RAW,
+                        &body_from_seed(&trials[i].seed, trials[i].size),
+                    );
+                    let params = Parameters::from(blake3::hash(&state).as_bytes().to_vec());
+                    let same = ContractContainer::Wasm(ContractWasmAPIVersion::V1(
+                        WrappedContract::new(code.clone(), params),
+                    ));
+                    send_req(
+                        &mut writer,
+                        ClientRequest::ContractOp(ContractRequest::Put {
+                            contract: same,
+                            state: WrappedState::from(state.clone()),
+                            related_contracts: RelatedContracts::default(),
+                            subscribe: false,
+                            blocking_subscribe: false,
+                        }),
+                        Duration::from_secs(60),
+                    )
+                    .await?;
+                    trials[i].hedged = true;
+                    hedged_bytes += state.len();
+                }
+            }
+        }
+
+        // One read-back attempt per pass, round-robin over the trials that do
+        // not have one yet, so no single slow key stalls the others' hedges.
+        let mut looked = 0usize;
+        while looked < trials.len() && !trials.is_empty() {
+            let i = next % trials.len();
+            next += 1;
+            looked += 1;
+            if trials[i].confirm_ms.is_none() {
+                if probe_once(
+                    &mut confirm,
+                    trials[i].key.id(),
+                    false,
+                    Duration::from_millis(200),
+                )
                 .await?
                 .is_some()
-            {
-                confirmed = Some(ms_since(*t));
+                {
+                    trials[i].confirm_ms = Some(ms_since(trials[i].t0));
+                }
                 break;
             }
         }
-        match confirmed {
-            Some(ms) => {
-                confirmed_n += 1;
-                println!("PUT {} {} {:.1} {}", key.id(), t_send, ms, size)
-            }
-            None => println!("# not readable within 2 s after send: {}", key.id()),
+
+        let done = to_send == plan.len()
+            && trials
+                .iter()
+                .all(|t| t.confirm_ms.is_some() && t.ack_ms.is_some() && t.marked);
+        if done {
+            break;
         }
     }
 
-    // Now collect whatever acks arrived, bounded — never blocking a put on one.
-    let mut acked = 0usize;
-    let ack_deadline = std::time::Instant::now() + wait.min(Duration::from_secs(90));
-    while acked < sent.len() && std::time::Instant::now() < ack_deadline {
-        let Some(left) = ack_deadline.checked_duration_since(std::time::Instant::now()) else {
-            break;
-        };
-        match timeout(left, writer.recv()).await {
-            Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { .. }))) => {
-                acked += 1
+    // Phase 3: one line per trial, with everything the pairing needs.
+    let mut confirmed_n = 0usize;
+    for t in &trials {
+        match t.confirm_ms {
+            Some(ms) => {
+                confirmed_n += 1;
+                println!(
+                    "PUT {} {} {:.1} {} {} {} {} {}",
+                    t.key.id(),
+                    t.sent_ns,
+                    ms,
+                    t.size,
+                    t.arm.as_str(),
+                    match t.unacked_at_t {
+                        Some(true) => "unacked",
+                        Some(false) => "acked",
+                        None => "-",
+                    },
+                    if t.hedged { "hedged" } else { "-" },
+                    t.ack_ms.map(|a| format!("{a:.1}")).unwrap_or("-".into()),
+                );
             }
-            Ok(Ok(_)) | Ok(Err(_)) => {}
-            Err(_) => break,
+            None => println!(
+                "# not readable on the writer within the budget: {}",
+                t.key.id()
+            ),
         }
     }
-    // The run asserts its own stimulus rather than leaving a later reader to
-    // notice. `expected` is the number of MINT lines; if fewer were sent, no
-    // result derived from this run means anything.
-    let expected = text.lines().filter(|l| l.starts_with("MINT ")).count();
-    if let Err(e) = stimulus_ok(expected, pending.len(), confirmed_n) {
+
+    if let Err(e) = stimulus_ok(expected, trials.len(), confirmed_n) {
         bail!("{e}");
     }
 
-    // Count SENDS and CONFIRMATIONS separately. They are different facts, and
-    // conflating them understated a stimulus once already: puts are issued in
-    // phase 1, so a failure during phase-2 confirmation leaves every block
-    // genuinely published while the line count suggests almost none were.
+    let acked = trials.iter().filter(|t| t.ack_ms.is_some()).count();
+    let fired = trials.iter().filter(|t| t.hedged).count();
+    let eligible = trials.iter().filter(|t| t.arm == Arm::Hedge).count();
     println!(
         "# stimulus: {} sent, {} read-back confirmed, {} acks collected (the rest are the \
          relay tail, not failures)",
-        pending.len(),
+        trials.len(),
         confirmed_n,
         acked
     );
+    if let Some(d) = hedge {
+        println!(
+            "# hedge: T={:.1}s, fired on {fired} of {eligible} hedge-arm trials, {} KiB re-sent",
+            d.as_secs_f64(),
+            hedged_bytes / 1024
+        );
+    }
     let _ = writer.send(ClientRequest::Disconnect { cause: None }).await;
     let _ = confirm
         .send(ClientRequest::Disconnect { cause: None })
@@ -480,6 +645,37 @@ async fn probe_once(
     }
 }
 
+/// Which arm a trial belongs to.
+///
+/// Assigned at MINT time and INTERLEAVED, so the two arms share the link's
+/// weather rather than one running before the other. A block's key is known
+/// before it is put, so the assignment cannot depend on anything the put
+/// observes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Arm {
+    /// Never re-puts. Its population is computed from its own ack times.
+    Control,
+    /// Re-puts at T when no acknowledgement has arrived.
+    Hedge,
+}
+
+impl Arm {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Arm::Control => "control",
+            Arm::Hedge => "hedge",
+        }
+    }
+    fn parse(s: &str) -> Arm {
+        match s {
+            "hedge" => Arm::Hedge,
+            // A file minted before arms existed is all control, which is what
+            // a run with no hedge is.
+            _ => Arm::Control,
+        }
+    }
+}
+
 /// One writer line: the key, when it was SENT, and the local confirm time.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Send {
@@ -487,6 +683,15 @@ pub struct Send {
     pub sent_ns: u128,
     pub confirm_ms: f64,
     pub size: usize,
+    pub arm: Arm,
+    /// Was this trial still unacknowledged when T came round? Taken in BOTH
+    /// arms, so "the population a hedge fires on" means the same thing on each
+    /// side of the comparison. `None` when the run had no T.
+    pub unacked_at_t: Option<bool>,
+    /// Did a hedge actually fire here?
+    pub hedged: bool,
+    /// ms from the send to this key's acknowledgement, where one arrived.
+    pub ack_ms: Option<f64>,
 }
 
 /// One reader line: the key and the absolute time this node first served it.
@@ -497,11 +702,28 @@ pub struct Hit {
     pub at_ms: f64,
 }
 
+/// One sound pair: how long until the FAR node served it, beside everything
+/// the writer knew about the same trial.
+///
+/// One row rather than two parallel lists. The conditional comparison and the
+/// ack-versus-far-readability question are asked of the same trials, and two
+/// vectors that have to stay in step are a way to ask them of different ones.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Joined {
+    pub size: usize,
+    /// ms from the writer's send until the far node first served the block.
+    pub far_ms: f64,
+    pub arm: Arm,
+    pub unacked_at_t: Option<bool>,
+    pub hedged: bool,
+    pub ack_ms: Option<f64>,
+}
+
 /// What pairing produced, including everything it REFUSED.
 #[derive(Debug, Default, PartialEq)]
 pub struct Paired {
-    /// (size, delta_ms) for every sound pair.
-    pub deltas: Vec<(usize, f64)>,
+    /// Every sound pair.
+    pub deltas: Vec<Joined>,
     /// Hits whose delta came out negative — impossible, so refused.
     pub refused_negative: usize,
     /// Hits naming a key the writer never reported sending.
@@ -526,8 +748,129 @@ pub fn pair(sends: &[Send], hits: &[Hit]) -> Paired {
                 if d < 0.0 {
                     out.refused_negative += 1;
                 } else {
-                    out.deltas.push((h.size, d));
+                    out.deltas.push(Joined {
+                        size: h.size,
+                        far_ms: d,
+                        arm: s.arm,
+                        unacked_at_t: s.unacked_at_t,
+                        hedged: s.hedged,
+                        ack_ms: s.ack_ms,
+                    });
                 }
+            }
+        }
+    }
+    out
+}
+
+/// The smallest conditioned population this instrument draws a comparison
+/// from.
+///
+/// A hedge fires on a minority of writes, so the population that matters is a
+/// fraction of the trials — and two arms of eight tell you about the eight.
+/// Below this the run says NO FINDING and prints the count, rather than a p50
+/// over a handful that reads like a result.
+pub const FLOOR: usize = 20;
+
+/// May this run be read as a comparison at all?
+///
+/// A decision rather than a printed sentence, so a test can put a population
+/// on each side of the floor and watch it change. A floor asserted against
+/// itself is not a floor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    /// The smaller conditioned arm is below [`FLOOR`].
+    NoFinding { smaller_arm: usize },
+    /// Both arms reached the floor.
+    Comparable { smaller_arm: usize },
+}
+
+pub fn verdict(rows: &[Joined]) -> Verdict {
+    let smaller_arm = [Arm::Control, Arm::Hedge]
+        .into_iter()
+        .map(|a| conditional(rows, a).n)
+        .min()
+        .unwrap_or(0);
+    if smaller_arm < FLOOR {
+        Verdict::NoFinding { smaller_arm }
+    } else {
+        Verdict::Comparable { smaller_arm }
+    }
+}
+
+/// One arm's conditioned population: the trials that were still unacknowledged
+/// when T came round.
+#[derive(Debug, Default, PartialEq)]
+pub struct Conditioned {
+    pub n: usize,
+    /// Time until the FAR node served it, for the trials it served.
+    pub far: Vec<f64>,
+    /// The acknowledgement, for the trials that got one. Reported BESIDE the
+    /// far-node number rather than instead of it: #11 measured the ack, and
+    /// the whole point of this run is that an ack is not the thing the engine
+    /// waits on.
+    pub ack: Vec<f64>,
+    /// Trials that never acknowledged at all. They are in `n`, and they are
+    /// the most unacknowledged trials there are.
+    pub never_acked: usize,
+    /// Trials the far node never served within the run.
+    pub never_far: usize,
+}
+
+/// Split the sound pairs into the two arms' conditioned populations.
+///
+/// The condition is `unacked_at_t == Some(true)` in BOTH arms — the mark the
+/// writer took at each trial's own T, whether or not it acted on it. A
+/// whole-arm comparison is diluted by the trials a hedge never touches, which
+/// is what freenet-harness#11 found and what makes this the only comparison
+/// worth printing.
+pub fn conditional(rows: &[Joined], arm: Arm) -> Conditioned {
+    let mut out = Conditioned::default();
+    for r in rows
+        .iter()
+        .filter(|r| r.arm == arm && r.unacked_at_t == Some(true))
+    {
+        out.n += 1;
+        out.far.push(r.far_ms);
+        match r.ack_ms {
+            Some(a) => out.ack.push(a),
+            None => out.never_acked += 1,
+        }
+    }
+    out
+}
+
+/// Does the acknowledgement predict readability on another node at all?
+///
+/// The question freenet-harness#11 could not ask. An ack that arrives AFTER
+/// the far node is already serving the block is not a signal a writer could
+/// have waited on; a block readable elsewhere with no ack at all says the same
+/// thing more strongly.
+#[derive(Debug, Default, PartialEq)]
+pub struct Proxy {
+    /// Pairs where both an ack and a far-node read exist.
+    pub both: usize,
+    /// ...of which the FAR node served the block before the ack arrived.
+    pub far_first: usize,
+    /// `ack_ms - far_ms` for those pairs: positive means the far node was
+    /// first, so the ack told the writer nothing it did not already have.
+    pub gaps: Vec<f64>,
+    /// Readable on the far node, never acknowledged. The ack cannot be a
+    /// precondition for these.
+    pub far_without_ack: usize,
+}
+
+pub fn proxy(rows: &[Joined]) -> Proxy {
+    let mut out = Proxy::default();
+    for r in rows {
+        match r.ack_ms {
+            None => out.far_without_ack += 1,
+            Some(a) => {
+                out.both += 1;
+                if r.far_ms < a {
+                    out.far_first += 1;
+                }
+                out.gaps.push(a - r.far_ms);
             }
         }
     }
@@ -567,6 +910,16 @@ pub fn pair_files(put_file: &str, read_file: &str) -> Result<()> {
                 sent_ns: f[2].parse().unwrap_or(0),
                 confirm_ms: f[3].parse().unwrap_or(0.0),
                 size: f[4].parse().unwrap_or(0),
+                // Absent in a file written before arms existed, which is a
+                // run with no hedge: all control, no mark, nothing fired.
+                arm: f.get(5).map(|a| Arm::parse(a)).unwrap_or(Arm::Control),
+                unacked_at_t: match f.get(6) {
+                    Some(&"unacked") => Some(true),
+                    Some(&"acked") => Some(false),
+                    _ => None,
+                },
+                hedged: f.get(7) == Some(&"hedged"),
+                ack_ms: f.get(8).and_then(|a| a.parse().ok()),
             })
         })
         .collect();
@@ -598,8 +951,8 @@ pub fn pair_files(put_file: &str, read_file: &str) -> Result<()> {
         );
     }
     let mut by: std::collections::BTreeMap<usize, Vec<f64>> = Default::default();
-    for (size, d) in &p.deltas {
-        by.entry(*size).or_default().push(*d);
+    for j in &p.deltas {
+        by.entry(j.size).or_default().push(j.far_ms);
     }
     let mut t = Table::new(["size", "n", "readable elsewhere p50", "min", "max"]);
     for (size, v) in &by {
@@ -613,7 +966,103 @@ pub fn pair_files(put_file: &str, read_file: &str) -> Result<()> {
         ]);
     }
     print!("{t}");
+    report_hedge(&p.deltas);
     Ok(())
+}
+
+/// The two tables this run exists for: the conditional comparison, and whether
+/// the acknowledgement predicts far-node readability at all.
+///
+/// Silent when the run had no arms, because a file from a no-hedge run has
+/// nothing to say about a hedge and a table of dashes reads like one that does.
+pub fn report_hedge(rows: &[Joined]) {
+    if !rows.iter().any(|r| r.unacked_at_t.is_some()) {
+        return;
+    }
+    let p50 = |v: &[f64]| {
+        Summary::of(v)
+            .map(|s| format!("{:.1}", s.p50))
+            .unwrap_or("-".into())
+    };
+    let p90 = |v: &[f64]| {
+        Summary::of(v)
+            .map(|s| format!("{:.1}", s.p90))
+            .unwrap_or("-".into())
+    };
+
+    println!();
+    println!(
+        "CONDITIONAL — only the trials still UNACKNOWLEDGED at T, which is the \
+         population a hedge fires on"
+    );
+    let mut t = Table::new([
+        "arm",
+        "n",
+        "readable elsewhere p50",
+        "p90",
+        "ack p50",
+        "p90",
+        "never acked",
+    ]);
+    for arm in [Arm::Control, Arm::Hedge] {
+        let c = conditional(rows, arm);
+        t.row([
+            arm.as_str().to_string(),
+            c.n.to_string(),
+            p50(&c.far),
+            p90(&c.far),
+            p50(&c.ack),
+            p90(&c.ack),
+            c.never_acked.to_string(),
+        ]);
+    }
+    print!("{t}");
+    if let Verdict::NoFinding { smaller_arm } = verdict(rows) {
+        println!(
+            "NO FINDING: the smaller conditioned arm has {smaller_arm} trials, below the floor \
+             of {FLOOR}. The numbers above describe those trials and nothing else — they are \
+             not evidence that a hedge does or does not help."
+        );
+    }
+
+    let fired = rows.iter().filter(|r| r.hedged).count();
+    let eligible = rows.iter().filter(|r| r.arm == Arm::Hedge).count();
+    if eligible > 0 {
+        println!(
+            "fire rate: {fired} of {eligible} hedge-arm trials ({:.0} %)",
+            100.0 * fired as f64 / eligible as f64
+        );
+    }
+
+    let x = proxy(rows);
+    println!();
+    println!("DOES THE ACK PREDICT FAR-NODE READABILITY?");
+    println!(
+        "  readable elsewhere with NO acknowledgement at all: {} of {} pairs",
+        x.far_without_ack,
+        rows.len()
+    );
+    println!(
+        "  of the {} pairs with both, the far node served it FIRST in {} ({:.0} %)",
+        x.both,
+        x.far_first,
+        if x.both > 0 {
+            100.0 * x.far_first as f64 / x.both as f64
+        } else {
+            0.0
+        }
+    );
+    println!(
+        "  ack - readable-elsewhere (ms, positive = the far node was first): p50 {} p90 {}",
+        p50(&x.gaps),
+        p90(&x.gaps)
+    );
+    if x.far_without_ack > 0 || x.far_first > 0 {
+        println!(
+            "  An ack that arrives after the block is already being served elsewhere is not a \
+             signal a writer could have waited on."
+        );
+    }
 }
 
 /// Print this machine's clock against a reference, so a cross-machine
@@ -627,6 +1076,9 @@ pub fn stamp() -> Result<()> {
 /// argument-count lint rather than growing a tenth positional parameter.
 pub struct ReadOpts {
     pub keys: String,
+    /// T for the hedge, in seconds; 0 turns it off and the run is exactly the
+    /// one that existed before arms did.
+    pub hedge_secs: f64,
     /// The reader's log, for the `pair` role.
     pub reads: String,
     pub return_code: bool,
@@ -645,8 +1097,17 @@ pub async fn run(
 ) -> Result<()> {
     match role {
         "write" => write(ws, wasm, samples, sizes, wait).await,
-        "mint" => mint_only(wasm, samples, sizes, &opts.keys).await,
-        "put" => put_minted(ws, wasm, &opts.keys, wait).await,
+        "mint" => mint_only(wasm, samples, sizes, &opts.keys, opts.hedge_secs > 0.0).await,
+        "put" => {
+            put_minted(
+                ws,
+                wasm,
+                &opts.keys,
+                (opts.hedge_secs > 0.0).then(|| Duration::from_secs_f64(opts.hedge_secs)),
+                wait,
+            )
+            .await
+        }
         "read" => {
             read(
                 ws,
@@ -673,6 +1134,10 @@ mod tests {
             sent_ns,
             confirm_ms: 100.0,
             size: 1024,
+            arm: Arm::Control,
+            unacked_at_t: None,
+            hedged: false,
+            ack_ms: None,
         }
     }
     fn h(key: &str, at_ms: f64) -> Hit {
@@ -686,7 +1151,9 @@ mod tests {
     #[test]
     fn a_sound_pair_yields_the_elapsed_time() {
         let p = pair(&[s("a", 1_000_000_000)], &[h("a", 1500.0)]);
-        assert_eq!(p.deltas, vec![(1024, 500.0)]);
+        assert_eq!(p.deltas.len(), 1);
+        assert_eq!(p.deltas[0].far_ms, 500.0);
+        assert_eq!(p.deltas[0].size, 1024);
         assert_eq!(p.refused_negative, 0);
     }
 
@@ -718,7 +1185,8 @@ mod tests {
             &[s("a", 1_000_000_000), s("b", 5_000_000_000)],
             &[h("a", 1200.0), h("b", 1000.0), h("zz", 9.0)],
         );
-        assert_eq!(p.deltas, vec![(1024, 200.0)]);
+        assert_eq!(p.deltas.len(), 1);
+        assert_eq!(p.deltas[0].far_ms, 200.0);
         assert_eq!(p.refused_negative, 1);
         assert_eq!(p.unmatched, 1);
     }
@@ -738,5 +1206,102 @@ mod tests {
             e.contains("confirmations are NOT the stimulus"),
             "must say why: {e}"
         );
+    }
+
+    fn j(arm: Arm, unacked: Option<bool>, hedged: bool, far: f64, ack: Option<f64>) -> Joined {
+        Joined {
+            size: 1024,
+            far_ms: far,
+            arm,
+            unacked_at_t: unacked,
+            hedged,
+            ack_ms: ack,
+        }
+    }
+
+    /// The comparison is CONDITIONAL, and the condition is the mark taken in
+    /// BOTH arms. A whole-arm comparison is diluted by the trials a hedge
+    /// never touches — measured on #11, where it buried the effect entirely.
+    #[test]
+    fn only_the_trials_unacked_at_t_are_compared() {
+        let rows = vec![
+            j(Arm::Control, Some(true), false, 900.0, Some(3000.0)),
+            j(Arm::Control, Some(false), false, 100.0, Some(80.0)),
+            j(Arm::Hedge, Some(true), true, 400.0, Some(1200.0)),
+            j(Arm::Hedge, Some(false), false, 120.0, Some(90.0)),
+        ];
+        let c = conditional(&rows, Arm::Control);
+        assert_eq!(c.n, 1, "a trial acked before T is not in the population");
+        assert_eq!(c.far, vec![900.0]);
+        let h = conditional(&rows, Arm::Hedge);
+        assert_eq!(h.n, 1);
+        assert_eq!(h.far, vec![400.0]);
+    }
+
+    /// A trial that NEVER acknowledged is the most unacknowledged trial there
+    /// is. Dropping it would select for the trials that recovered, which is
+    /// the population a hedge exists to rescue.
+    #[test]
+    fn a_trial_that_never_acked_counts_and_is_named() {
+        let rows = vec![
+            j(Arm::Control, Some(true), false, 5000.0, None),
+            j(Arm::Control, Some(true), false, 800.0, Some(2000.0)),
+        ];
+        let c = conditional(&rows, Arm::Control);
+        assert_eq!(c.n, 2, "the never-acked trial is in the population");
+        assert_eq!(c.far.len(), 2, "and its far-node time is a measurement");
+        assert_eq!(c.ack.len(), 1, "but it contributes no ack");
+        assert_eq!(c.never_acked, 1, "and it is counted separately");
+    }
+
+    /// A run with no arms must produce no conditioned population at all,
+    /// rather than one made of every trial.
+    #[test]
+    fn a_run_without_a_hedge_has_no_conditioned_population() {
+        let rows = vec![j(Arm::Control, None, false, 100.0, Some(50.0))];
+        assert_eq!(conditional(&rows, Arm::Control), Conditioned::default());
+    }
+
+    /// The question #11 could not ask: an ack arriving after the far node is
+    /// already serving the block is not a signal a writer could have waited on.
+    #[test]
+    fn the_proxy_question_counts_both_ways_round() {
+        let rows = vec![
+            // far node first: the ack told the writer nothing new
+            j(Arm::Control, Some(true), false, 300.0, Some(2000.0)),
+            // ack first
+            j(Arm::Control, Some(true), false, 4000.0, Some(900.0)),
+            // readable elsewhere, never acked at all
+            j(Arm::Hedge, Some(true), true, 700.0, None),
+        ];
+        let x = proxy(&rows);
+        assert_eq!(x.both, 2);
+        assert_eq!(x.far_first, 1);
+        assert_eq!(x.far_without_ack, 1);
+        assert_eq!(x.gaps, vec![1700.0, -3100.0]);
+    }
+
+    /// The floor decides, and it decides at the boundary. One trial short of
+    /// it in EITHER arm is no finding — a run is only as strong as its smaller
+    /// conditioned population.
+    #[test]
+    fn one_trial_short_in_either_arm_is_no_finding() {
+        let arm_of = |arm, n| (0..n).map(move |_| j(arm, Some(true), false, 100.0, None));
+        let full: Vec<Joined> = arm_of(Arm::Control, FLOOR)
+            .chain(arm_of(Arm::Hedge, FLOOR))
+            .collect();
+        assert_eq!(verdict(&full), Verdict::Comparable { smaller_arm: FLOOR });
+        let short: Vec<Joined> = arm_of(Arm::Control, FLOOR)
+            .chain(arm_of(Arm::Hedge, FLOOR - 1))
+            .collect();
+        assert_eq!(
+            verdict(&short),
+            Verdict::NoFinding {
+                smaller_arm: FLOOR - 1
+            }
+        );
+        // And a run with no conditioned trials at all is not a comparison
+        // either — the emptiest case must not fall through to Comparable.
+        assert_eq!(verdict(&[]), Verdict::NoFinding { smaller_arm: 0 });
     }
 }

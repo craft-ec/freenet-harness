@@ -357,6 +357,15 @@ enum Cmd {
         /// The reader's log, for `--role pair`.
         #[arg(long, default_value = "reads.txt")]
         reads: String,
+        /// Re-put a block that has no acknowledgement after this many seconds.
+        ///
+        /// 0 turns it off, and the run is exactly the one that existed before
+        /// arms did. Above 0 the `mint` role splits the blocks into
+        /// INTERLEAVED control and hedge arms, and `put` takes the
+        /// still-unacknowledged mark in BOTH so the conditional comparison has
+        /// a control in the same state at the same instant (freenet-harness#11).
+        #[arg(long, default_value_t = 0.0)]
+        hedge_secs: f64,
         #[arg(long, default_value_t = 20)]
         samples: usize,
         #[arg(long, value_delimiter = ',', default_values_t = [1024, 16384, 262144])]
@@ -762,6 +771,7 @@ async fn main() -> Result<()> {
             wasm,
             keys,
             reads,
+            hedge_secs,
             samples,
             sizes,
             return_code,
@@ -777,6 +787,7 @@ async fn main() -> Result<()> {
                 xnode::ReadOpts {
                     keys,
                     reads,
+                    hedge_secs,
                     return_code,
                     probe_ms,
                     limit_secs,
