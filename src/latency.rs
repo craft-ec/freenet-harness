@@ -878,7 +878,7 @@ async fn probe_delegate_put(
     })
 }
 
-fn describe_environment(node_version: &str) {
+pub(crate) fn describe_environment(node_version: &str) {
     println!(
         "command:  {}",
         std::env::args().collect::<Vec<_>>().join(" ")
@@ -999,7 +999,7 @@ fn machine() -> String {
 }
 
 /// The node version, or an honest admission that we could not read it.
-fn node_version() -> String {
+pub(crate) fn node_version() -> String {
     run_tool("freenet", &["--version"])
         .map(|v| v.lines().collect::<Vec<_>>().join(" · "))
         .unwrap_or_else(|| "unknown — `freenet --version` did not run on this machine".into())
