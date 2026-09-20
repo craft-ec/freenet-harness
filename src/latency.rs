@@ -12,7 +12,10 @@ use std::{
 };
 
 use anyhow::{anyhow, bail, Result};
+use craftec_bag_contract as bag_contract;
 use craftec_block_contract as block;
+use craftec_register_contract as register_contract;
+use craftec_set_contract as set_contract;
 use freenet_stdlib::{
     client_api::{ClientRequest, ContractRequest, ContractResponse, HostResponse, WebApi},
     prelude::*,
@@ -27,18 +30,65 @@ type Make = fn(&Arc<ContractCode<'static>>, usize) -> Result<(ContractContainer,
 
 /// A contract kind the table measures.
 ///
-/// Only Block exists today. Register, Set and Derived each become **one more
-/// entry in [`KINDS`]** plus their own `make` — no change to the measurement
-/// loops, the tables or the CLI.
+/// A kind is three things: the artefact it is, how a fresh instance of it is
+/// built, and the largest body it can carry. The ceiling belongs here rather
+/// than in the CLI because it is the CONTRACT's, not the run's — a Register
+/// refuses a value over `MAX_VALUE` however `--sizes` is spelled, and a series
+/// that asked for one would report node errors for a fixture mistake.
+#[derive(Debug)]
 struct Kind {
     name: &'static str,
+    /// The wasm's file name, taken from the directory `--wasm` names. All four
+    /// artefacts come out of one `freenet-contracts/build.sh`, so naming three
+    /// more paths on the command line could only ever disagree with it.
+    wasm: &'static str,
+    /// The largest BODY this kind can carry, from the contract's own limits.
+    cap: usize,
+    /// Why, in the contract's own terms. A size skipped without a reason reads
+    /// as a failure.
+    cap_why: &'static str,
     make: Make,
 }
 
-const KINDS: &[Kind] = &[Kind {
-    name: "Block",
-    make: make_block,
-}];
+/// How many slots a measured Set has, and how many pointers a measured Bag
+/// has. Both are set to the contract's own maximum so the size ladder is as
+/// long as the format allows; both are reported with the numbers, because a
+/// Set of 64 slots and a Set of 8 are not the same contract to put.
+const SET_M: u16 = set_contract::wire::MAX_M;
+const BAG_M: u16 = 1024;
+
+/// Block stays FIRST. Parts 3 to 6 measure Block specifically and reach it as
+/// `KINDS[0]`; reordering this list would silently re-point them.
+const KINDS: &[Kind] = &[
+    Kind {
+        name: "Block",
+        wasm: "block.wasm",
+        cap: block::MAX_BODY,
+        cap_why: "block::MAX_BODY, the largest RAW body a Block will hold",
+        make: make_block,
+    },
+    Kind {
+        name: "Register",
+        wasm: "register.wasm",
+        cap: register_contract::wire::MAX_VALUE,
+        cap_why: "register::wire::MAX_VALUE — a register holds ONE value",
+        make: make_register,
+    },
+    Kind {
+        name: "Set",
+        wasm: "set.wasm",
+        cap: SET_M as usize * set_contract::wire::MAX_PAYLOAD as usize,
+        cap_why: "MAX_M slots x MAX_PAYLOAD — a Set cannot hold more than it keeps",
+        make: make_set,
+    },
+    Kind {
+        name: "Bag",
+        wasm: "bag.wasm",
+        cap: BAG_M as usize * bag_contract::wire::MAX_PAYLOAD as usize,
+        cap_why: "M pointers x MAX_PAYLOAD",
+        make: make_bag,
+    },
+];
 
 /// A Block of `size` random bytes: fresh randomness means a key no node has
 /// seen, so every put is a first put and never a no-op re-put.
@@ -55,6 +105,169 @@ fn make_block(
         params,
     )));
     Ok((contract, state))
+}
+
+/// A Register holding one non-terminal record whose value is `size` random
+/// bytes.
+///
+/// The label carries eight random bytes and the params are RE-PARSED from the
+/// salted bytes before anything is signed. `keyset_seeded` takes one byte and
+/// hardcodes the label, which makes the key space 256 wide — measured on the
+/// round-trip, 5 runs in 30 opened on another run's final state. A key is
+/// `hash(code, params)` and every signature binds to `blake3(params)`, so the
+/// salt has to be in place BEFORE the record is made, not after.
+fn make_register(
+    code: &Arc<ContractCode<'static>>,
+    size: usize,
+) -> Result<(ContractContainer, Vec<u8>)> {
+    use register_contract::{testing, wire::Params};
+    let mut salt = [0u8; 9];
+    getrandom::getrandom(&mut salt)?;
+    let mut w = testing::keyset_seeded(salt[0], 2, 4, false);
+    let seeded = w.params_bytes.clone();
+    w.params_bytes.extend_from_slice(&salt[1..]);
+    w.params = Params::parse(&w.params_bytes)
+        .ok_or_else(|| anyhow!("the salted register params must still parse"))?;
+    if w.params_bytes == seeded {
+        bail!("the register salt changed nothing — two samples could share a key");
+    }
+    let mut value = vec![0u8; size];
+    getrandom::getrandom(&mut value)?;
+    let state = w.encode(&w.state(w.record(false, 1, &value)));
+    let contract = ContractContainer::Wasm(ContractWasmAPIVersion::V1(WrappedContract::new(
+        code.clone(),
+        Parameters::from(w.params_bytes.clone()),
+    )));
+    Ok((contract, state))
+}
+
+/// A Set holding `size` bytes of payload, spread over as few owner-tier items
+/// as `MAX_PAYLOAD` allows.
+///
+/// Every item is signed by the OWNER, so admission is never the thing being
+/// timed: an item that needed a capability would make the series depend on
+/// whether the cap was also in the state.
+fn make_set(
+    code: &Arc<ContractCode<'static>>,
+    size: usize,
+) -> Result<(ContractContainer, Vec<u8>)> {
+    use set_contract::wire::{Admission, MAX_PAYLOAD};
+    let mut salt = [0u8; 9];
+    getrandom::getrandom(&mut salt)?;
+    // quota = M: the owner is allowed to hold every slot, so the item count is
+    // bounded by the size asked for and not by a quota the table never states.
+    let mut w = set_contract::testing::world_with(salt[0], 2, Admission::Cap, SET_M, SET_M, 0);
+    w.params.label = salt[1..].to_vec();
+    w.params_bytes = w.params.encode();
+    let per = MAX_PAYLOAD as usize;
+    let mut items = Vec::new();
+    let mut left = size;
+    while left > 0 || items.is_empty() {
+        let take = left.min(per);
+        let mut payload = vec![0u8; take];
+        getrandom::getrandom(&mut payload)?;
+        let i = items.len();
+        items.push(w.item(0, format!("k{i:04}").as_bytes(), 10 + i as u64, &payload));
+        left -= take;
+    }
+    if items.len() > SET_M as usize {
+        bail!(
+            "{} items asked for, but this Set keeps {SET_M} — the cap in KINDS is wrong",
+            items.len()
+        );
+    }
+    let state = w.encode(&w.state(items));
+    let contract = ContractContainer::Wasm(ContractWasmAPIVersion::V1(WrappedContract::new(
+        code.clone(),
+        Parameters::from(w.params_bytes.clone()),
+    )));
+    Ok((contract, state))
+}
+
+/// A Bag holding `size` bytes of payload, spread over as few pointers as
+/// `MAX_PAYLOAD` allows.
+///
+/// `work_bits = 0`. The price of a name is the Bag's own cost and it is paid by
+/// the CLIENT, not the node: mining it here would put the harness's CPU inside
+/// a latency this table attributes to the network. The tables say so.
+///
+/// The pointers are encoded in RANK order — work descending, then name
+/// ascending. `BagState::parse` requires it and rejects the whole candidate
+/// otherwise, and an unreadable candidate is ignored rather than fatal, so
+/// mining order would add NO pointers rather than some, silently.
+fn make_bag(
+    code: &Arc<ContractCode<'static>>,
+    size: usize,
+) -> Result<(ContractContainer, Vec<u8>)> {
+    use bag_contract::{
+        testing,
+        wire::{BagState, Held, MAX_PAYLOAD},
+    };
+    let mut p = testing::params(0, BAG_M);
+    let mut salt = [0u8; 12];
+    getrandom::getrandom(&mut salt)?;
+    p.bucket = u32::from_le_bytes(salt[..4].try_into().expect("4 bytes"));
+    p.label = salt[4..].to_vec();
+    let ph = p.hash();
+    let per = MAX_PAYLOAD as usize;
+    let mut held: Vec<Held> = Vec::new();
+    let mut left = size;
+    while left > 0 || held.is_empty() {
+        let take = left.min(per);
+        let mut payload = vec![0u8; take];
+        getrandom::getrandom(&mut payload)?;
+        held.push(Held::of(
+            testing::mine(&p, &payload, held.len() as u64),
+            &ph,
+        ));
+        left -= take;
+    }
+    if held.len() > BAG_M as usize {
+        bail!(
+            "{} pointers asked for, but this Bag keeps {BAG_M} — the cap in KINDS is wrong",
+            held.len()
+        );
+    }
+    held.sort_by_key(|x| x.rank());
+    let state = BagState { held }.encode();
+    let contract = ContractContainer::Wasm(ContractWasmAPIVersion::V1(WrappedContract::new(
+        code.clone(),
+        Parameters::from(p.encode()),
+    )));
+    Ok((contract, state))
+}
+
+/// Why this kind cannot be measured at this size, if it cannot.
+///
+/// Separate from the loop so it can be tested: inline, the only way to find out
+/// that a ceiling was off by one would be a live run that quietly measured one
+/// row fewer.
+fn skip_note(kind: &Kind, size: usize) -> Option<String> {
+    (size > kind.cap).then(|| {
+        format!(
+            "{} {}: not measured — {} holds at most {} ({})",
+            kind.name,
+            kib(size),
+            kind.name,
+            kib(kind.cap),
+            kind.cap_why
+        )
+    })
+}
+
+/// Every sample of one series must encode to the same number of bytes, or the
+/// percentiles are over a mixture and the table's `state` column names none of
+/// it.
+fn same_weight(kind: &Kind, size: usize, first: usize, now: usize, nth: usize) -> Result<()> {
+    if first == now {
+        return Ok(());
+    }
+    bail!(
+        "{} {}: sample {nth} encodes to {now} B where the first encoded to {first} B — \
+         this series is a mixture, not a measurement",
+        kind.name,
+        kib(size)
+    )
 }
 
 /// Every contract key this run asked the node to store.
@@ -374,6 +587,11 @@ async fn timed_get(
 struct Series {
     kind: &'static str,
     size: usize,
+    /// What the node was actually asked to store, which is not the body size:
+    /// a Register adds a keyset's signatures, a Set adds a key and a signature
+    /// per item. Comparing "PUT 4 KiB" across kinds without this compares four
+    /// different numbers of bytes.
+    state_bytes: usize,
     /// How many samples were ASKED for. A series that stopped at its budget
     /// reports fewer than this, and the gap is the measurement: "we did not
     /// wait long enough to find out" is a different statement from "30 puts
@@ -419,6 +637,9 @@ async fn measure_series(
     let mut stale_get = 0usize;
     let mut put = Vec::with_capacity(n);
     let mut held: Vec<(ContractKey, Vec<u8>)> = Vec::with_capacity(n);
+    // Every sample of one series must be the same weight, or the percentiles
+    // are over a mixture and the table's size column names none of it.
+    let mut state_bytes = 0usize;
     for i in 0..n {
         // The budget is checked BEFORE a sample is started, never during: a
         // sample cut off half way is not a fast sample and must not enter the
@@ -434,6 +655,11 @@ async fn measure_series(
             break;
         }
         let (contract, state) = (kind.make)(code, size)?;
+        if state_bytes == 0 {
+            state_bytes = state.len();
+        } else {
+            same_weight(kind, size, state_bytes, state.len(), i + 1)?;
+        }
         let key = contract.key();
         minted.add(*key.id());
         let s = timed_put(client, contract, &state, wait, &mut stale_put).await?;
@@ -481,6 +707,7 @@ async fn measure_series(
     Ok(Series {
         kind: kind.name,
         size,
+        state_bytes,
         wanted: n,
         stale: stale_put + stale_get,
         put,
@@ -1005,10 +1232,18 @@ pub(crate) fn node_version() -> String {
         .unwrap_or_else(|| "unknown — `freenet --version` did not run on this machine".into())
 }
 
-/// Which of the four measurements to run.
-#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+/// Which of the measurements to run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum Part {
     All,
+    /// Parts 1 and 2 together: the put/get ladder and nothing else.
+    ///
+    /// `--only put` and `--only get` both RUN the ladder — a get needs a put —
+    /// and differ only in which table they print, so asking for both means two
+    /// runs over two different populations. The other parts all measure Block
+    /// specifically, so a run of another kind that asked for `all` would spend
+    /// its budget on parts that print SKIPPED.
+    Series,
     Put,
     Get,
     Parallel,
@@ -1019,8 +1254,92 @@ pub enum Part {
 
 impl Part {
     fn wants(self, p: Part) -> bool {
-        self == Part::All || self == p
+        self == Part::All
+            || self == p
+            || (self == Part::Series && matches!(p, Part::Put | Part::Get))
     }
+}
+
+/// The kinds named on the command line, de-duplicated and put back into
+/// [`KINDS`] order so the table reads the same however the flag was spelled.
+fn select_kinds(names: &[String]) -> Result<Vec<&'static Kind>> {
+    let all = || KINDS.iter().map(|k| k.name).collect::<Vec<_>>().join(", ");
+    if names.is_empty() {
+        bail!("--kinds names nothing to measure; the kinds are {}", all());
+    }
+    // By INDEX, never by pointer identity. `KINDS` is a `const`, so every use
+    // site may get its own copy of the slice and `ptr::eq` between two of them
+    // is false — which made this function silently return the kinds in the
+    // order they were typed. Caught by the ordering test, not by the compiler.
+    let mut idx: Vec<usize> = Vec::new();
+    for n in names {
+        let i = KINDS
+            .iter()
+            .position(|k| k.name.eq_ignore_ascii_case(n))
+            .ok_or_else(|| anyhow!("no contract kind called {n:?}; the kinds are {}", all()))?;
+        if idx.contains(&i) {
+            bail!("--kinds names {n:?} twice");
+        }
+        idx.push(i);
+    }
+    idx.sort_unstable();
+    Ok(idx.into_iter().map(|i| &KINDS[i]).collect())
+}
+
+/// Each measured kind's artefact, refused unless it is the one the caller says
+/// it is.
+///
+/// `--expect-sha` is `<kind>=<sha256 prefix>`, and EVERY measured kind needs
+/// one. Measuring four contracts is four chances to time a build nobody ships,
+/// and a check that may be omitted is one nobody can tell was skipped: a run
+/// with no check and a run whose check passed print the same thing.
+///
+/// The three other wasms are taken from the directory `--wasm` names rather
+/// than from three more flags. One `freenet-contracts/build.sh` writes all
+/// four, so separate paths could only ever disagree with it — and a run that
+/// took Block from today's build and Set from a directory left over from last
+/// week would print one table.
+fn load_codes(
+    selected: &[&'static Kind],
+    block_wasm: &str,
+    expect: &[String],
+) -> Result<HashMap<&'static str, Arc<ContractCode<'static>>>> {
+    let dir = std::path::Path::new(block_wasm)
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let mut want: HashMap<String, String> = HashMap::new();
+    for e in expect {
+        let (k, v) = e
+            .split_once('=')
+            .ok_or_else(|| anyhow!("--expect-sha {e:?} is not <kind>=<sha256 prefix>"))?;
+        if want.insert(k.to_ascii_lowercase(), v.to_string()).is_some() {
+            bail!("--expect-sha names {k:?} twice");
+        }
+    }
+    // Every kind is matched to its hash BEFORE anything is read. Interleaved,
+    // a missing entry for the third kind is reported only after the first two
+    // artefacts have loaded — and if one of those paths is wrong, the error
+    // names a file and the operator never learns the flag was incomplete.
+    let mut plan = Vec::new();
+    for k in selected {
+        let sha = want.get(&k.name.to_ascii_lowercase()).ok_or_else(|| {
+            anyhow!(
+                "--expect-sha has no entry for {}. Pass {}=<sha256 prefix>, the hash \
+                 freenet-contracts/build.sh printed for build/{}.",
+                k.name,
+                k.name,
+                k.wasm
+            )
+        })?;
+        plan.push((*k, sha.clone()));
+    }
+    let mut out = HashMap::new();
+    for (k, sha) in plan {
+        let path = dir.join(k.wasm);
+        let bytes = crate::wasm_check::load(&path.to_string_lossy(), &sha)?;
+        out.insert(k.name, Arc::new(ContractCode::from(bytes)));
+    }
+    Ok(out)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1028,6 +1347,8 @@ pub async fn run(
     ws: &str,
     wasm: &str,
     delegate_wasm: &str,
+    kinds: &[String],
+    expect_sha: &[String],
     samples: usize,
     sizes: &[usize],
     parallel: &[usize],
@@ -1041,9 +1362,12 @@ pub async fn run(
     if samples == 0 {
         bail!("--samples 0 measures nothing");
     }
-    let code = Arc::new(ContractCode::from(std::fs::read(wasm).map_err(|e| {
-        anyhow!("{wasm}: {e} — run ../freenet-contracts/build.sh first")
-    })?));
+    let selected = select_kinds(kinds)?;
+    let codes = load_codes(&selected, wasm, expect_sha)?;
+    // Parts 3 to 6 are about Block specifically. If Block is not being
+    // measured its artefact was never loaded, and those parts say so rather
+    // than loading one nobody checked.
+    let block_code = codes.get(KINDS[0].name).cloned();
     let version = node_version();
     describe_environment(&version);
 
@@ -1064,15 +1388,23 @@ pub async fn run(
     let mut client = crate::connect(ws).await?;
     let mut minted = Minted::default();
 
-    // 1 & 2. Put, then warm get, every kind at every size.
+    // 1 & 2. Put, then warm get, every measured kind at every size it can hold.
     let mut series = Vec::new();
+    // Sizes a kind's own format refuses. Reported under the table, never
+    // silently dropped: a row missing from a ladder reads as a measurement
+    // that failed, and this one was never possible.
+    let mut skipped: Vec<String> = Vec::new();
     if only.wants(Part::Put) || only.wants(Part::Get) {
-        for kind in KINDS {
+        for kind in &selected {
             for &size in sizes {
+                if let Some(note) = skip_note(kind, size) {
+                    skipped.push(note);
+                    continue;
+                }
                 let s = measure_series(
                     &mut client,
                     kind,
-                    &code,
+                    &codes[kind.name],
                     SeriesSpec {
                         size,
                         n: samples,
@@ -1095,10 +1427,19 @@ pub async fn run(
     let mut readable = Vec::new();
     if only.wants(Part::Readable) && spent() {
         println!("part readable: SKIPPED — the run reached its budget before it started");
+    } else if only.wants(Part::Readable) && block_code.is_none() {
+        println!(
+            "part readable: SKIPPED — it measures {} and --kinds did not name it",
+            KINDS[0].name
+        );
     } else if only.wants(Part::Readable) {
+        let code = block_code.clone().expect("checked just above");
         let mut reader = crate::connect(ws).await?;
-        for kind in KINDS {
+        for kind in &KINDS[..1] {
             for &size in sizes {
+                if size > kind.cap {
+                    continue;
+                }
                 let rows = measure_readable(
                     Pair {
                         writer: &mut client,
@@ -1131,7 +1472,13 @@ pub async fn run(
     let mut runs = Vec::new();
     if only.wants(Part::Parallel) && spent() {
         println!("part parallel: SKIPPED — the run reached its budget before it started");
+    } else if only.wants(Part::Parallel) && block_code.is_none() {
+        println!(
+            "part parallel: SKIPPED — it measures {} and --kinds did not name it",
+            KINDS[0].name
+        );
     } else if only.wants(Part::Parallel) {
+        let code = block_code.clone().expect("checked just above");
         for &n in parallel {
             let r = measure_parallel(
                 &mut client,
@@ -1185,8 +1532,14 @@ pub async fn run(
         print_series(&series, |s| &s.put);
     }
     if only.wants(Part::Get) {
-        println!("2. GET latency (ms) — warm: a block this node just put");
+        println!("2. GET latency (ms) — warm: a contract this node just put");
         print_series(&series, |s| &s.get);
+    }
+    for line in &skipped {
+        println!("{line}");
+    }
+    if !skipped.is_empty() {
+        println!();
     }
     if only.wants(Part::Parallel) {
         println!(
@@ -1216,9 +1569,11 @@ pub async fn run(
 
 fn print_series(series: &[Series], pick: fn(&Series) -> &Vec<Sample>) {
     let mut t = Table::new(
-        ["kind", "size", "asked", "n", "errors", ">=240s", ">10xp50"]
-            .into_iter()
-            .chain(Summary::HEADINGS),
+        [
+            "kind", "body", "state", "asked", "n", "errors", ">=240s", ">10xp50",
+        ]
+        .into_iter()
+        .chain(Summary::HEADINGS),
     );
     let mut notes = Vec::new();
     for s in series {
@@ -1247,6 +1602,7 @@ fn print_series(series: &[Series], pick: fn(&Series) -> &Vec<Sample>) {
         let head = vec![
             s.kind.to_string(),
             kib(s.size),
+            kib(s.state_bytes),
             s.wanted.to_string(),
             lat.len().to_string(),
             errs.len().to_string(),
@@ -1552,5 +1908,327 @@ mod tests {
         assert_eq!(w.stale, 0);
         assert!(w.offer(Some(&7)));
         assert_eq!(w.stale, 0, "a clean match discards nothing");
+    }
+
+    // ---- the kind table ---------------------------------------------------
+
+    /// Any bytes: the validators below read the STATE and the PARAMS and never
+    /// the code, and using a real artefact would make a unit test wait on a
+    /// contract build.
+    fn some_code() -> Arc<ContractCode<'static>> {
+        Arc::new(ContractCode::from(vec![0u8; 8]))
+    }
+
+    /// The check `validate_state` itself performs, per kind.
+    ///
+    /// A fixture that builds a state its contract refuses produces a run of
+    /// node errors that reads as a node fault. It has happened twice here: a
+    /// 1 MiB RAW body Block refuses, and a pack 86 bytes over `MAX_PACK`.
+    fn accepted(kind: &Kind, c: &ContractContainer, state: &[u8]) -> bool {
+        let params = c.params();
+        let p = params.as_ref();
+        match kind.name {
+            "Block" => block::check(p, state),
+            "Register" => register_contract::read(p, state).is_some(),
+            "Set" => set_contract::read(p, state).is_some(),
+            "Bag" => bag_contract::read(p, state).is_some(),
+            other => panic!(
+                "no validator wired for {other}: a kind added to KINDS without one \
+                 is measured but never checked"
+            ),
+        }
+    }
+
+    #[test]
+    fn every_kind_builds_a_state_its_own_contract_accepts() {
+        let code = some_code();
+        for kind in KINDS {
+            for size in [1usize, 1024, kind.cap] {
+                let (c, state) = (kind.make)(&code, size)
+                    .unwrap_or_else(|e| panic!("{} at {size} B: {e}", kind.name));
+                assert!(
+                    accepted(kind, &c, &state),
+                    "{} at {size} B built a {} B state its own contract refuses",
+                    kind.name,
+                    state.len()
+                );
+            }
+        }
+    }
+
+    /// The ceiling in [`KINDS`] has to be the CONTRACT's, not a number someone
+    /// typed. One byte over it must be refused by the same validator —
+    /// otherwise a cap set too low only shortens the table, and the test above
+    /// passes while the real limit is somewhere else entirely.
+    #[test]
+    fn one_byte_over_a_kinds_cap_is_not_a_state_that_contract_accepts() {
+        let code = some_code();
+        for kind in KINDS {
+            match (kind.make)(&code, kind.cap + 1) {
+                // The fixture refused to build it: the cap bit here.
+                Err(_) => {}
+                Ok((c, state)) => assert!(
+                    !accepted(kind, &c, &state),
+                    "{}: cap {} is not this contract's limit — {} B was accepted",
+                    kind.name,
+                    kind.cap,
+                    kind.cap + 1
+                ),
+            }
+        }
+    }
+
+    /// Two samples of one series must address two DIFFERENT contracts. A
+    /// repeated key makes the second put a MERGE into the first's state, which
+    /// is a different and much cheaper operation — measured on the Register
+    /// round-trip, where a 256-wide key space put 5 runs in 30 on top of each
+    /// other.
+    #[test]
+    fn many_instances_of_a_kind_never_share_a_key() {
+        // Forty, not two. Every kind here seeds from ONE byte somewhere —
+        // `keyset_seeded`, `world_with` — and a 256-wide key space passes a
+        // two-draw test 255 times in 256 while colliding at about nineteen
+        // draws. On the Register round-trip that space put 5 runs in 30 on top
+        // of each other, and the run read the previous run's final state.
+        const DRAWS: usize = 40;
+        let code = some_code();
+        for kind in KINDS {
+            let keys: HashSet<_> = (0..DRAWS)
+                .map(|_| (kind.make)(&code, 64).unwrap().0.key())
+                .collect();
+            assert_eq!(
+                keys.len(),
+                DRAWS,
+                "{}: {} of {DRAWS} fresh instances shared a contract key — a repeated \
+                 key makes the second put a MERGE, which is a different operation",
+                kind.name,
+                DRAWS - keys.len()
+            );
+        }
+    }
+
+    /// One series, one weight. If a `size` encodes to two different lengths,
+    /// the percentiles are over a mixture and the table's `state` column names
+    /// neither of them.
+    #[test]
+    fn a_kinds_state_size_is_a_function_of_the_body_size() {
+        let code = some_code();
+        for kind in KINDS {
+            for size in [1usize, 1000, kind.cap] {
+                let (_, a) = (kind.make)(&code, size).unwrap();
+                let (_, b) = (kind.make)(&code, size).unwrap();
+                assert_eq!(
+                    a.len(),
+                    b.len(),
+                    "{} at {size} B encodes to two different lengths",
+                    kind.name
+                );
+            }
+        }
+    }
+
+    /// A body bigger than the one asked for would make every row in the table
+    /// understate what was sent.
+    #[test]
+    fn a_kinds_state_is_at_least_the_body_it_was_asked_to_carry() {
+        let code = some_code();
+        for kind in KINDS {
+            let (_, state) = (kind.make)(&code, 4096.min(kind.cap)).unwrap();
+            assert!(
+                state.len() >= 4096.min(kind.cap),
+                "{}: a {} B body encoded to {} B of state",
+                kind.name,
+                4096.min(kind.cap),
+                state.len()
+            );
+        }
+    }
+
+    // ---- choosing kinds and checking their artefacts ----------------------
+
+    #[test]
+    fn an_unknown_kind_is_refused_and_names_the_ones_that_exist() {
+        let e = select_kinds(&["Blorb".into()]).unwrap_err().to_string();
+        assert!(e.contains("Blorb") && e.contains("Block"), "{e}");
+    }
+
+    #[test]
+    fn a_kind_named_twice_is_refused() {
+        let e = select_kinds(&["Block".into(), "block".into()])
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("twice"), "{e}");
+    }
+
+    #[test]
+    fn naming_no_kind_at_all_is_refused() {
+        let e = select_kinds(&[]).unwrap_err().to_string();
+        assert!(e.contains("nothing to measure"), "{e}");
+    }
+
+    /// The control for the three refusals above: they must fail for their own
+    /// reason and not because `select_kinds` refuses everything.
+    #[test]
+    fn kinds_are_case_insensitive_and_come_back_in_table_order() {
+        let got = select_kinds(&["bag".into(), "BLOCK".into()]).unwrap();
+        assert_eq!(
+            got.iter().map(|k| k.name).collect::<Vec<_>>(),
+            ["Block", "Bag"]
+        );
+    }
+
+    /// A directory holding a file per kind, and the hashes a build would have
+    /// printed for them.
+    fn artefacts(tag: &str) -> (std::path::PathBuf, Vec<String>) {
+        let dir = std::env::temp_dir().join(format!("latency-kinds-{tag}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut expect = Vec::new();
+        for k in KINDS {
+            let bytes = format!("not a wasm, but the hash is real: {}", k.name).into_bytes();
+            std::fs::write(dir.join(k.wasm), &bytes).unwrap();
+            expect.push(format!(
+                "{}={}",
+                k.name,
+                &crate::wasm_check::sha256_hex(&bytes)[..16]
+            ));
+        }
+        (dir, expect)
+    }
+
+    /// The refusal has to name the KIND, and it has to happen before any file
+    /// is opened.
+    ///
+    /// The artefacts deliberately do not exist here. Matched kind by kind as
+    /// they load, the first thing to fail is Block's missing file and the
+    /// operator is told a path is wrong when the real fault is an incomplete
+    /// flag — so this test is about the ORDER, and it passes vacuously if the
+    /// directory is one where the files are present.
+    #[test]
+    fn a_missing_expect_sha_is_refused_by_kind_before_any_artefact_is_opened() {
+        let nowhere = std::env::temp_dir().join("latency-kinds-nowhere/block.wasm");
+        let _ = std::fs::remove_dir_all(nowhere.parent().unwrap());
+        let sel = select_kinds(&["Block".into(), "Set".into()]).unwrap();
+        let e = load_codes(&sel, nowhere.to_str().unwrap(), &["Block=deadbeef".into()])
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("Set"), "{e}");
+        assert!(
+            !e.contains("No such file"),
+            "a file was opened before the flag was checked: {e}"
+        );
+
+        // Control: with the Set entry supplied, the same call DOES get as far
+        // as opening a file — so the assertion above is about the missing
+        // entry and not about `load_codes` refusing everything.
+        let e = load_codes(
+            &sel,
+            nowhere.to_str().unwrap(),
+            &["Block=deadbeef".into(), "Set=deadbeef".into()],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("No such file"), "{e}");
+    }
+
+    #[test]
+    fn an_expect_sha_that_is_not_kind_equals_hash_is_refused() {
+        let (dir, _) = artefacts("malformed");
+        let sel = select_kinds(&["Block".into()]).unwrap();
+        let e = load_codes(
+            &sel,
+            dir.join("block.wasm").to_str().unwrap(),
+            &["deadbeef01".into()],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("<kind>=<sha256 prefix>"), "{e}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Every kind's artefact is taken from the directory the Block wasm sits
+    /// in, and each is checked against ITS OWN hash — swapping two of them has
+    /// to be refused, or the "check" only proves the files exist.
+    #[test]
+    fn each_kinds_artefact_is_checked_against_its_own_hash() {
+        let (dir, expect) = artefacts("swapped");
+        let sel = select_kinds(&["Block".into(), "Set".into()]).unwrap();
+        let path = dir.join("block.wasm");
+        let path = path.to_str().unwrap();
+
+        // Control: the right hashes load, so the refusal below is about the
+        // swap and not about this fixture.
+        load_codes(&sel, path, &expect).expect("the matching hashes must load");
+
+        let swapped: Vec<String> = expect
+            .iter()
+            .map(|e| {
+                let (k, h) = e.split_once('=').unwrap();
+                match k {
+                    "Block" => format!("Block={}", expect_hash_of(&expect, "Set")),
+                    "Set" => format!("Set={}", expect_hash_of(&expect, "Block")),
+                    _ => format!("{k}={h}"),
+                }
+            })
+            .collect();
+        let e = load_codes(&sel, path, &swapped).unwrap_err().to_string();
+        assert!(e.contains("wasm mismatch"), "{e}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn expect_hash_of(expect: &[String], kind: &str) -> String {
+        expect
+            .iter()
+            .find_map(|e| e.strip_prefix(&format!("{kind}=")))
+            .expect("every kind has an entry")
+            .to_string()
+    }
+
+    /// A size the contract cannot hold is skipped, and the note says WHY —
+    /// a row missing from a ladder with no reason reads as a measurement that
+    /// failed.
+    #[test]
+    fn a_size_over_a_kinds_cap_is_skipped_with_its_reason() {
+        for kind in KINDS {
+            let note = skip_note(kind, kind.cap + 1).expect("one byte over must be skipped");
+            assert!(
+                note.contains(kind.name) && note.contains(kind.cap_why),
+                "{note}"
+            );
+            // The control: at the cap, and below it, the kind IS measured.
+            // Without this the function could skip everything and still pass.
+            assert!(
+                skip_note(kind, kind.cap).is_none(),
+                "{} skipped its own cap",
+                kind.name
+            );
+            assert!(skip_note(kind, 1).is_none(), "{} skipped 1 byte", kind.name);
+        }
+    }
+
+    /// The mixture guard has to bite on a difference of ONE byte, and has to
+    /// stay silent when there is none.
+    #[test]
+    fn a_series_whose_samples_change_weight_is_refused() {
+        let k = &KINDS[0];
+        same_weight(k, 4096, 4160, 4160, 2).expect("equal weights are a measurement");
+        let e = same_weight(k, 4096, 4160, 4161, 7).unwrap_err().to_string();
+        assert!(e.contains("sample 7") && e.contains("mixture"), "{e}");
+    }
+    /// `--only series` is parts 1 and 2 and NOTHING else. If it ever started
+    /// wanting a part that needs the Block artefact, a run measuring Register
+    /// alone would try to load a wasm nobody named.
+    #[test]
+    fn only_series_is_the_ladder_and_nothing_that_needs_block() {
+        assert!(Part::Series.wants(Part::Put));
+        assert!(Part::Series.wants(Part::Get));
+        for p in [Part::Readable, Part::Parallel, Part::DelegatePut, Part::All] {
+            assert!(!Part::Series.wants(p), "--only series wanted {p:?}");
+        }
+        // The control: `all` still wants everything, so the clause above did
+        // not simply stop `wants` answering yes.
+        for p in [Part::Put, Part::Get, Part::Readable, Part::Parallel] {
+            assert!(Part::All.wants(p));
+        }
     }
 }

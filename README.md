@@ -44,6 +44,42 @@ same name.
 green.** Four Rust trees plus wasm targets took this machine to 168 MiB free and
 killed a tool call mid-run.
 
+## `latency`: the put/get ladder, per contract kind
+
+    cargo run --release -- --local latency \
+      --kinds Register,Set,Bag \
+      --expect-sha Register=e273be8c6f35a739,Set=688cb0c656a7ec3d,Bag=32e10cd6131eb3c5 \
+      --only series --samples 30 --budget-secs 900
+
+`--wasm` names the Block artefact; the other three are taken from the same
+directory, because one `freenet-contracts/build.sh` writes all four and a second
+path could only ever disagree with it.
+
+**`--expect-sha` is `<kind>=<sha256 prefix>`, and every measured kind needs
+one.** Four contracts is four chances to time a build nobody ships, and a run
+with no check and a run whose check passed print the same table.
+
+**`--only series` is parts 1 and 2 and nothing else.** `--only put` and
+`--only get` both RUN the ladder — a get needs a put — and differ only in which
+table they print, so asking for both would mean two runs over two different
+populations. Parts 3 to 6 all measure Block specifically and say SKIPPED when
+`--kinds` does not name it.
+
+**Every kind has a ceiling, and it is the contract's.** A Register holds one
+value (`MAX_VALUE`, 4 KiB); a Set keeps `MAX_M` slots of `MAX_PAYLOAD`; a Bag
+keeps `M` pointers. A size above the ceiling is reported under the table as not
+measured, with the limit that refused it — a row silently missing from a ladder
+reads as a measurement that failed.
+
+**The table has a `body` column and a `state` column, and they are different
+numbers.** A 4 KiB body is 4242 B of Register state and 6040 B of Set state:
+comparing "PUT 4 KiB" across kinds without the second column compares four
+different weights.
+
+**The Bag fixture mines at `work_bits = 0`.** The price of a name is the Bag's
+own cost and the CLIENT pays it, so mining inside the timed section would put
+this machine's CPU inside a latency the table attributes to the network.
+
 ## Epoch artefacts for `upgrade-cycle`
 
 `upgrade-cycle` needs two builds of each contract, from two real commits, so a
