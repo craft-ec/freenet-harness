@@ -3,8 +3,15 @@
 Drives a real Freenet node: deploys contracts, round-trips state, records
 timings. Every measured number in `craftworks-docs` comes from here.
 
-    cargo run -- roundtrip --n 3 --size 4096      # put N blocks, read them back
-    ./probe-delegate/build.sh && cargo run -- delegate-probe   # what can a delegate do on this node?
+    WS='ws://127.0.0.1:<your node's port>/v1/contract/command?encodingProtocol=native'
+    cargo run -- --ws "$WS" roundtrip --n 3 --size 4096      # put N blocks, read them back
+    ./probe-delegate/build.sh && cargo run -- --ws "$WS" delegate-probe   # what can a delegate do on this node?
+
+**Every run names its node with `--ws`. There is no default**, and ports 7509
+and 7609 — the owner's nodes — are refused on any host, before a socket opens
+(freenet-harness#45). `--local` only LABELS the node at `--ws` as local-mode;
+it never changes where the socket goes. `kill9` starts its own node and
+refuses both flags.
 
 ## Runbook: running a measurement without voiding it
 
@@ -74,7 +81,7 @@ killed a tool call mid-run.
 
 ## `latency`: the put/get ladder, per contract kind
 
-    cargo run --release -- --local latency \
+    cargo run --release -- --local --ws "$WS" latency \
       --kinds Register,Set,Bag \
       --expect-sha Register=e273be8c6f35a739,Set=688cb0c656a7ec3d,Bag=32e10cd6131eb3c5 \
       --only series --samples 30 --budget-secs 900
@@ -133,7 +140,7 @@ several sessions work in these folders:
 
 Then:
 
-    cargo run -- --local upgrade-cycle \
+    cargo run -- --local --ws "$WS" upgrade-cycle \
       --sha-block-a 21ae7e73 --sha-block-b 1521dddb \
       --sha-register-a a3be5ec4 --sha-register-b e273be8c --n 100
 
