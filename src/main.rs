@@ -38,18 +38,27 @@ use tokio::time::timeout;
 
 #[derive(Parser)]
 struct Cli {
-    /// The node's client API.
-    #[arg(
-        long,
-        default_value = "ws://127.0.0.1:7509/v1/contract/command?encodingProtocol=native"
-    )]
-    ws: String,
-    /// Target the LOCAL-mode node (port 7609) instead of the network node.
+    /// The node's client API — REQUIRED, and never 7509 or 7609.
     ///
-    /// Anything asking "does the contract behave" belongs here: local mode
-    /// pays ~30 ms per put and has no relay tail, so a functional round-trip
-    /// finishes in seconds. Network mode is for propagation, latency and byte
-    /// measurements only — and every table says which one produced it.
+    /// There is NO default, deliberately (freenet-harness#45). The default was
+    /// the owner's network node, so a bare invocation of a round trip PUT
+    /// state into a protected node without anyone having typed its port.
+    /// Every connect target is given explicitly, and `connect` refuses the
+    /// owner's ports before a socket opens.
+    #[arg(long)]
+    ws: Option<String>,
+    /// Says the node at `--ws` runs in LOCAL mode. A LABEL, not a route.
+    ///
+    /// Anything asking "does the contract behave" belongs on a local-mode
+    /// node: it pays ~30 ms per put and has no relay tail, so a functional
+    /// round-trip finishes in seconds. Network mode is for propagation,
+    /// latency and byte measurements only — and every table says which one
+    /// produced it.
+    ///
+    /// It used to ALSO pick the endpoint — the owner's local node on 7609 —
+    /// and silently discarded an explicit `--ws` (freenet-harness#45). Mode
+    /// and target are independent now: this flag never changes where a
+    /// socket goes.
     #[arg(long, default_value_t = false)]
     local: bool,
     #[arg(long, default_value_t = 120)]
@@ -492,7 +501,99 @@ enum Cmd {
 /// recovery becoming the stall.
 const CONNECT: Duration = Duration::from_secs(15);
 
+/// The owner's nodes: network (7509) and local mode (7609). No run of this
+/// tool connects to either, on any host — a loopback alias, `0.0.0.0` or a
+/// hostname can all reach the same process, so the refusal is by PORT.
+pub(crate) const PROTECTED_PORTS: [u16; 2] = [7509, 7609];
+
+/// The port a `ws://` / `wss://` URL names — EXPLICITLY. A URL with no port
+/// would connect to the scheme's default, which is a target nobody typed.
+pub(crate) fn endpoint_port(ws: &str) -> Result<u16> {
+    let rest = ws
+        .strip_prefix("ws://")
+        .or_else(|| ws.strip_prefix("wss://"))
+        .ok_or_else(|| anyhow!("{ws:?} is not a ws:// or wss:// URL"))?;
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let hostport = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    let port = match hostport.strip_prefix('[') {
+        // [v6]:port — the colons inside the brackets are the address's.
+        Some(v6) => v6.split_once(']').and_then(|(_, p)| p.strip_prefix(':')),
+        None => hostport.rsplit_once(':').map(|(_, p)| p),
+    };
+    match port {
+        Some(p) if !p.is_empty() => p
+            .parse::<u16>()
+            .map_err(|_| anyhow!("{ws:?}: port {p:?} is not a port")),
+        _ => bail!("{ws:?} names no port — give one explicitly"),
+    }
+}
+
+/// Is this a target this tool may connect to? Checked on the RESOLVED URL,
+/// before any socket opens.
+pub(crate) fn check_endpoint(ws: &str, protected: &[u16]) -> Result<()> {
+    let port = endpoint_port(ws)?;
+    if protected.contains(&port) {
+        bail!(
+            "refusing {ws}: port {port} is the owner's node. This tool never \
+             connects to 7509 or 7609 — run your own node on its own port."
+        );
+    }
+    Ok(())
+}
+
+/// Where the node-facing subcommands connect, from the flags as given.
+///
+/// `starts_own_node` is true for a subcommand that spawns its own node and
+/// connects to nothing else (`kill9`): an endpoint or a mode given to it
+/// would be ignored, so it is REFUSED rather than silently dropped — the
+/// silent drop is the defect this replaces.
+pub(crate) fn resolve_target(
+    ws: Option<&str>,
+    local: bool,
+    starts_own_node: bool,
+) -> Result<Option<String>> {
+    if starts_own_node {
+        if ws.is_some() || local {
+            bail!("this subcommand starts its OWN node: --ws and --local would be ignored, so they are refused");
+        }
+        return Ok(None);
+    }
+    let ws = ws.ok_or_else(|| {
+        anyhow!(
+            "no endpoint: pass --ws ws://127.0.0.1:<port>/v1/contract/command?encodingProtocol=native \
+             for YOUR node (never 7509/7609). There is no default."
+        )
+    })?;
+    check_endpoint(ws, &PROTECTED_PORTS)?;
+    Ok(Some(ws.to_string()))
+}
+
+/// `resolve_target` over the parsed flags, plus every OTHER endpoint flag
+/// (`group --read-ws`). The one routing decision `main` makes — the tests
+/// call this, so a route added in `main` itself would be a route they miss.
+fn target_of(cli: &Cli) -> Result<Option<String>> {
+    let target = resolve_target(
+        cli.ws.as_deref(),
+        cli.local,
+        matches!(cli.cmd, Cmd::Kill9 { .. }),
+    )?;
+    if let Cmd::Group { read_ws, .. } = &cli.cmd {
+        check_endpoint(read_ws, &PROTECTED_PORTS)?;
+    }
+    Ok(target)
+}
+
 pub(crate) async fn connect(ws: &str) -> Result<probe::Client> {
+    connect_guarded(ws, &PROTECTED_PORTS).await
+}
+
+/// `connect`, with the protected set passed in so a test can prove the
+/// refusal happens before a socket opens — against a listener of its own.
+async fn connect_guarded(ws: &str, protected: &[u16]) -> Result<probe::Client> {
+    // EVERY connection in this tool comes through here, so this is the one
+    // place the refusal cannot be routed around by a new subcommand or a
+    // second endpoint flag.
+    check_endpoint(ws, protected)?;
     let (stream, _) = match timeout(CONNECT, tokio_tungstenite::connect_async(ws)).await {
         Ok(r) => r.map_err(|e| anyhow!("cannot reach the node at {ws}: {e}"))?,
         Err(_) => bail!(
@@ -663,15 +764,17 @@ pub(crate) async fn poll_stat(
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     let wait = Duration::from_secs(cli.timeout_secs);
-    let ws = if cli.local {
-        "ws://127.0.0.1:7609/v1/contract/command?encodingProtocol=native".to_string()
-    } else {
-        cli.ws.clone()
-    };
-    println!(
-        "mode:     {} ({ws})",
-        if cli.local { "LOCAL" } else { "network" }
-    );
+    let starts_own_node = matches!(cli.cmd, Cmd::Kill9 { .. });
+    let target = target_of(&cli)?;
+    // Only `kill9` has no target, and it connects only to the node it starts;
+    // an empty string here would still be refused by `connect`.
+    let ws = target.unwrap_or_default();
+    if !starts_own_node {
+        println!(
+            "mode:     {} ({ws})",
+            if cli.local { "LOCAL" } else { "network" }
+        );
+    }
     match cli.cmd {
         Cmd::Roundtrip { wasm, n, size } => {
             let code = Arc::new(ContractCode::from(std::fs::read(&wasm)?));
@@ -1113,4 +1216,165 @@ async fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Where a socket goes, decided from the flags alone (freenet-harness#45).
+///
+/// PURE, except the last two, which use a listener of their OWN on an
+/// ephemeral port. Nothing here opens a socket to 7509 or 7609 — a test that
+/// could reach the owner's node if the guard regressed would be the defect it
+/// tests for.
+#[cfg(test)]
+mod endpoint {
+    use super::*;
+
+    const URL: &str = "/v1/contract/command?encodingProtocol=native";
+    fn at(port: u16) -> String {
+        format!("ws://127.0.0.1:{port}{URL}")
+    }
+    /// Parse exactly as `main` does, then resolve exactly as `main` does.
+    fn route(args: &[&str]) -> Result<Option<String>> {
+        let cli =
+            Cli::try_parse_from(std::iter::once("freenet-harness").chain(args.iter().copied()))
+                .map_err(|e| anyhow!("{e}"))?;
+        target_of(&cli)
+    }
+
+    #[test]
+    fn local_keeps_the_explicit_endpoint() {
+        // THE REPORTED TRIGGER: --local used to replace this with 7609.
+        let got = route(&["--local", "--ws", &at(18888), "roundtrip"]).unwrap();
+        assert_eq!(
+            got,
+            Some(at(18888)),
+            "--local changed where the socket goes"
+        );
+    }
+
+    #[test]
+    fn network_takes_the_explicit_endpoint() {
+        // CONTROL: a legitimate explicit port is accepted.
+        assert_eq!(
+            route(&["--ws", &at(18889), "roundtrip"]).unwrap(),
+            Some(at(18889))
+        );
+    }
+
+    #[test]
+    fn no_endpoint_is_refused_not_defaulted() {
+        for args in [&["roundtrip"][..], &["--local", "roundtrip"][..]] {
+            let e = route(args).unwrap_err().to_string();
+            assert!(
+                e.contains("no endpoint"),
+                "{args:?} resolved to something: {e}"
+            );
+        }
+    }
+
+    #[test]
+    fn protected_ports_are_refused_on_every_host_and_mode() {
+        for port in [7509u16, 7609] {
+            for host in ["127.0.0.1", "localhost", "0.0.0.0", "[::1]", "node.example"] {
+                for local in [false, true] {
+                    let ws = format!("ws://{host}:{port}{URL}");
+                    let mut args = vec!["--ws", ws.as_str()];
+                    if local {
+                        args.insert(0, "--local");
+                    }
+                    args.push("roundtrip");
+                    let e = route(&args).expect_err(&format!("{ws} (local={local}) was accepted"));
+                    assert!(
+                        e.to_string().contains("owner's node"),
+                        "{ws}: wrong refusal: {e}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn group_read_endpoint_is_guarded_too() {
+        let e = route(&["--ws", &at(18888), "group", "--read-ws", &at(7609)])
+            .expect_err("a protected --read-ws was accepted");
+        assert!(e.to_string().contains("owner's node"), "{e}");
+        // CONTROL
+        assert!(route(&["--ws", &at(18888), "group", "--read-ws", &at(18890)]).is_ok());
+    }
+
+    #[test]
+    fn a_url_with_no_port_is_refused() {
+        // It would connect to the scheme's default — a target nobody typed.
+        for ws in [
+            "ws://127.0.0.1/v1",
+            "ws://127.0.0.1:/v1",
+            "ws://[::1]/v1",
+            "http://127.0.0.1:18888/",
+        ] {
+            assert!(
+                check_endpoint(ws, &PROTECTED_PORTS).is_err(),
+                "{ws} was accepted"
+            );
+        }
+        // CONTROL: the same shapes WITH a port are accepted, so the parser is
+        // not simply refusing everything.
+        for ws in [
+            "ws://127.0.0.1:18888/v1",
+            "ws://[::1]:18888/v1",
+            "wss://u@h:18888?x",
+            "ws://h:18888",
+        ] {
+            assert_eq!(endpoint_port(ws).unwrap(), 18888, "{ws}");
+        }
+    }
+
+    #[test]
+    fn a_node_starting_subcommand_refuses_an_endpoint() {
+        let base = ["kill9", "--expect-sha", "abc"];
+        // CONTROL first: with neither flag it resolves to no target.
+        assert_eq!(route(&base).unwrap(), None);
+        for pre in [&["--ws", "ws://127.0.0.1:18888/x"][..], &["--local"][..]] {
+            let args: Vec<&str> = pre.iter().chain(base.iter()).copied().collect();
+            let e = route(&args).expect_err(&format!("{args:?} was accepted and would be ignored"));
+            assert!(e.to_string().contains("OWN node"), "{e}");
+        }
+    }
+
+    /// The refusal happens BEFORE a socket opens: a listener of our own,
+    /// declared protected for this call, sees no connection at all.
+    #[tokio::test]
+    async fn connect_refuses_before_opening_a_socket() {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.set_nonblocking(true).unwrap();
+        let port = l.local_addr().unwrap().port();
+        let e = connect_guarded(&at(port), &[port])
+            .await
+            .err()
+            .expect("a protected port connected");
+        assert!(e.to_string().contains("owner's node"), "{e}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        match l.accept() {
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            other => panic!("the guard ran AFTER a socket opened: {other:?}"),
+        }
+    }
+
+    /// CONTROL for the one above: with the port NOT protected, the same call
+    /// really does reach the listener — so "no connection" above is the
+    /// guard, not a test that could not have seen one.
+    #[tokio::test]
+    async fn connect_reaches_an_unprotected_listener() {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        let seen = tokio::spawn(async move { l.accept().await.is_ok() });
+        // No websocket server behind it, so the handshake fails — the point is
+        // only that the socket opened.
+        let _ = connect_guarded(&at(port), &[]).await;
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), seen)
+                .await
+                .unwrap()
+                .unwrap(),
+            "the control never reached its own listener"
+        );
+    }
 }
