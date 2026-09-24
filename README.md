@@ -115,6 +115,42 @@ different weights.
 own cost and the CLIENT pays it, so mining inside the timed section would put
 this machine's CPU inside a latency the table attributes to the network.
 
+## `race-get`: k of k+3 readable on a second node, per SDK arm (#13)
+
+The reader is the SDK ENGINE's own read path (`page_io::PageIo::reader`),
+linked from the SDK checkout at `../craftworks-sdk`. So the ARM is the SDK
+build, not a flag: build this tool once per SDK checkout, each into its OWN
+`CARGO_TARGET_DIR` (a target shared by two checkouts links the other one's
+code), and `build.rs` stamps the SDK revision into every record.
+
+    # the two arms: the engine before race get (craftworks-sdk#331) and after
+    ln -sfn <sdk checkout at 1b01fc1^> ../craftworks-sdk
+    CARGO_TARGET_DIR=<target-serial> cargo build --release   # -> rg-serial
+    ln -sfn <sdk checkout at main> ../craftworks-sdk          # (pkg/ built: ./build.sh)
+    CARGO_TARGET_DIR=<target-race> cargo build --release     # -> rg-race
+
+    rg-race   race-get up    --dir RUN --pkg ../craftworks-sdk/pkg/web   # gateway A + publish
+    rg-serial race-get read  --dir RUN --arm serial --trials 1 --first-trial 1 --trial-secs 120
+    rg-race   race-get read  --dir RUN --arm race   --trials 1 --first-trial 2 --trial-secs 120
+    ...                                                  # INTERLEAVED, trial by trial
+    rg-race   race-get score --dir RUN
+    rg-race   race-get down  --dir RUN
+
+**`up` runs once; both arms read the SAME published groups.** Each `read`
+trial starts a FRESH peer joined to A (new dirs: cold by construction) and
+removes it afterwards. **The interval is a group's parent node → its k-th
+block**, event-timed as each message arrives: the part a race reader and a
+serial reader do differently, and nothing else.
+
+**Nothing waits on a stall**: every wait has a deadline, a trial has
+`--trial-secs`, a role has `--budget-mins`, and a group short of k by its
+trial's end is `not within T`, counted in the table.
+
+**What the local pair cannot show.** Two private nodes on one machine have no
+relay and no downstream wait (F20), so the tail race get exists to cut is the
+real network's. A real-network arm (the reader beside a node in another
+datacentre) runs only with core dev's OK under the Hetzner rules.
+
 ## Epoch artefacts for `upgrade-cycle`
 
 `upgrade-cycle` needs two builds of each contract, from two real commits, so a

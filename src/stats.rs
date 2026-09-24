@@ -9,7 +9,7 @@ use std::fmt::Write as _;
 ///
 /// Nearest rank, not interpolation: every printed number is a sample that was
 /// actually observed, so "p99 = 812 ms" names a put that really took 812 ms.
-fn nearest_rank(sorted: &[f64], pct: f64) -> f64 {
+pub(crate) fn nearest_rank(sorted: &[f64], pct: f64) -> f64 {
     debug_assert!(!sorted.is_empty());
     let n = sorted.len() as f64;
     let rank = (pct / 100.0 * n).ceil().max(1.0) as usize;

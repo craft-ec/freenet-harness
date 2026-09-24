@@ -11,6 +11,7 @@ mod pack;
 mod parity;
 mod probe;
 mod putshape;
+mod raceget;
 mod register;
 mod set;
 mod stats;
@@ -272,6 +273,47 @@ enum Cmd {
         n: usize,
         #[arg(long, default_value_t = 4096)]
         size: usize,
+    },
+    /// Time until k of a parity group's k+3 are readable on a SECOND node,
+    /// read through the SDK ENGINE's own read path (freenet-harness#13; see
+    /// `raceget.rs`). Starts its own PRIVATE nodes: no --ws.
+    RaceGet {
+        /// `up` (gateway + publish), `read` (fresh peer per trial), `score`, `down`.
+        role: String,
+        /// Everything the run keeps: node dirs, the run file, the records.
+        /// REQUIRED: there is no default place to start nodes in.
+        #[arg(long)]
+        dir: std::path::PathBuf,
+        /// The SDK build output (signer, block and register wasm).
+        #[arg(long, default_value = "../craftworks-sdk/pkg/web")]
+        pkg: std::path::PathBuf,
+        /// `up`: rows to publish.
+        #[arg(long, default_value_t = 3000)]
+        rows: usize,
+        /// `up`: bytes per row value.
+        #[arg(long, default_value_t = 1024)]
+        value_bytes: usize,
+        /// `read`: this arm's name in the records. The SDK revision is added
+        /// by the build; the name is for a reader of the table.
+        #[arg(long, default_value = "")]
+        arm: String,
+        /// `read`: trials (each a fresh reader node).
+        #[arg(long, default_value_t = 1)]
+        trials: usize,
+        /// `read`: the first trial's number, so interleaved binaries number
+        /// their trials in one sequence.
+        #[arg(long, default_value_t = 1)]
+        first_trial: usize,
+        /// `read`: one trial's deadline, s. A group short of k by then is
+        /// `not within T`.
+        #[arg(long, default_value_t = 300)]
+        trial_secs: u64,
+        /// `read`: refuse a tree with fewer groups than this (the issue's n).
+        #[arg(long, default_value_t = 10)]
+        min_groups: usize,
+        /// Total minutes for the role.
+        #[arg(long, default_value_t = 10)]
+        budget_mins: u64,
     },
     /// How long until k of n pieces are readable on ANOTHER node, with our
     /// strategies on (BASELINE) and off (RAW). A timing stand-in for erasure.
@@ -575,7 +617,7 @@ fn target_of(cli: &Cli) -> Result<Option<String>> {
     let target = resolve_target(
         cli.ws.as_deref(),
         cli.local,
-        matches!(cli.cmd, Cmd::Kill9 { .. }),
+        matches!(cli.cmd, Cmd::Kill9 { .. } | Cmd::RaceGet { .. }),
     )?;
     if let Cmd::Group { read_ws, .. } = &cli.cmd {
         check_endpoint(read_ws, &PROTECTED_PORTS)?;
@@ -764,7 +806,7 @@ pub(crate) async fn poll_stat(
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     let wait = Duration::from_secs(cli.timeout_secs);
-    let starts_own_node = matches!(cli.cmd, Cmd::Kill9 { .. });
+    let starts_own_node = matches!(cli.cmd, Cmd::Kill9 { .. } | Cmd::RaceGet { .. });
     let target = target_of(&cli)?;
     // Only `kill9` has no target, and it connects only to the node it starts;
     // an empty string here would still be refused by `connect`.
@@ -776,6 +818,44 @@ async fn main() -> Result<()> {
         );
     }
     match cli.cmd {
+        Cmd::RaceGet {
+            role,
+            dir,
+            pkg,
+            rows,
+            value_bytes,
+            arm,
+            trials,
+            first_trial,
+            trial_secs,
+            min_groups,
+            budget_mins,
+        } => {
+            std::fs::create_dir_all(&dir)?;
+            let budget = Duration::from_secs(budget_mins * 60);
+            match role.as_str() {
+                "up" => raceget::up(&dir, &pkg, rows, value_bytes, budget).await?,
+                "read" if arm.is_empty() => {
+                    bail!("`read` needs --arm: the records name which arm each trial was")
+                }
+                "read" => {
+                    raceget::read(
+                        &dir,
+                        &pkg,
+                        &arm,
+                        trials,
+                        first_trial,
+                        trial_secs,
+                        budget,
+                        min_groups,
+                    )
+                    .await?
+                }
+                "score" => raceget::score(&dir)?,
+                "down" => raceget::down(&dir)?,
+                r => bail!("unknown race-get role `{r}`: up | read | score | down"),
+            }
+        }
         Cmd::Roundtrip { wasm, n, size } => {
             let code = Arc::new(ContractCode::from(std::fs::read(&wasm)?));
             let mut client = connect(&ws).await?;
